@@ -1,0 +1,11 @@
+[package]
+name = "retrix"
+version = "0.1.0"
+authors = ["Amanda Graven <amanda@amandag.net>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+iced = "0.1"
+matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "27c6f30" }
