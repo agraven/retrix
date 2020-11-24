@@ -1,6 +1,6 @@
 use iced::{
     text_input::{self, TextInput},
-    Application, Button, Column, Command, Container, Element, Text,
+    Application, Button, Column, Command, Container, Element, Length, Row, Text,
 };
 
 use crate::matrix;
@@ -21,17 +21,23 @@ pub enum Retrix {
     LoggedIn {
         client: matrix_sdk::Client,
         session: matrix_sdk::Session,
+
+        rooms: Vec<matrix_sdk::Room>,
     },
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    // Login form messages
     SetUser(String),
     SetPassword(String),
     SetServer(String),
     Login,
     LoggedIn(matrix_sdk::Client, matrix_sdk::Session),
     SetError(String),
+
+    // Main state messages
+    ResetRooms(Vec<matrix_sdk::Room>),
 }
 
 impl Application for Retrix {
@@ -83,10 +89,32 @@ impl Application for Retrix {
                         },
                     );
                 }
-                Message::LoggedIn(client, session) => *self = Retrix::LoggedIn { client, session },
+                Message::LoggedIn(client, session) => {
+                    *self = Retrix::LoggedIn {
+                        client: client.clone(),
+                        session,
+                        rooms: Vec::new(),
+                    };
+                    let client = client.clone();
+                    Command::perform(
+                        async move {
+                            let mut list = Vec::new();
+                            for (id, room) in client.joined_rooms().read().await.iter() {
+                                let room = room.read().await;
+                                list.push(room.clone());
+                            }
+                            list
+                        },
+                        |rooms| Message::ResetRooms(rooms),
+                    );
+                }
+                _ => (),
             },
-            _ => (),
-        }
+            Retrix::LoggedIn { ref mut rooms, .. } => match message {
+                Message::ResetRooms(r) => *rooms = r,
+                _ => (),
+            },
+        };
         Command::none()
     }
 
@@ -102,6 +130,7 @@ impl Application for Retrix {
                 ref server,
                 ref error,
             } => {
+                // Login form
                 let mut content = Column::new()
                     .width(500.into())
                     .push(Text::new("Username"))
@@ -136,10 +165,16 @@ impl Application for Retrix {
                     .height(iced::Length::Fill)
                     .into()
             }
-            Retrix::LoggedIn {
-                ref client,
-                ref session,
-            } => Text::new(format!("Logged in to {}", session.user_id)).into(),
+            Retrix::LoggedIn { ref rooms, .. } => {
+                //let mut root_row = Row::new().width(Length::Fill).height(Length::Fill);
+                let mut room_col = Column::new().width(400.into()).height(Length::Fill);
+                for room in rooms {
+                    room_col = room_col.push(Text::new(room.display_name()));
+                }
+                room_col.into()
+                //root_row = root_row.push(room_col);
+                //root_row.into()
+            }
         }
     }
 }
