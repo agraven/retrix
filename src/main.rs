@@ -1,8 +1,9 @@
-use iced::Sandbox;
+use iced::Application;
 
 pub mod matrix;
 pub mod ui;
 
-fn main() {
-    ui::Retrix::run(iced::Settings::default())
+#[tokio::main]
+async fn main() {
+    ui::Retrix::run(iced::Settings::default());
 }

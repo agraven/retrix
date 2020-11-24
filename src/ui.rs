@@ -1,7 +1,9 @@
 use iced::{
     text_input::{self, TextInput},
-    Button, Column, Container, Element, Sandbox, Text,
+    Application, Button, Column, Command, Container, Element, Text,
 };
+
+use crate::matrix;
 
 #[derive(Debug, Clone)]
 pub enum Retrix {
@@ -14,8 +16,12 @@ pub enum Retrix {
         user: String,
         password: String,
         server: String,
+        error: Option<String>,
     },
-    LoggedIn,
+    LoggedIn {
+        client: matrix_sdk::Client,
+        session: matrix_sdk::Session,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -24,13 +30,17 @@ pub enum Message {
     SetPassword(String),
     SetServer(String),
     Login,
+    LoggedIn(matrix_sdk::Client, matrix_sdk::Session),
+    SetError(String),
 }
 
-impl Sandbox for Retrix {
+impl Application for Retrix {
     type Message = Message;
+    type Executor = iced::executor::Default;
+    type Flags = ();
 
-    fn new() -> Self {
-        Retrix::Prompt {
+    fn new(_flags: ()) -> (Self, Command<Self::Message>) {
+        let app = Retrix::Prompt {
             user_input: text_input::State::new(),
             password_input: text_input::State::new(),
             server_input: text_input::State::new(),
@@ -39,28 +49,45 @@ impl Sandbox for Retrix {
             user: String::new(),
             password: String::new(),
             server: String::new(),
-        }
+            error: None,
+        };
+        (app, Command::none())
     }
 
     fn title(&self) -> String {
         String::from("Retrix matrix client")
     }
 
-    fn update(&mut self, message: Self::Message) {
+    fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
         match *self {
             Retrix::Prompt {
                 ref mut user,
                 ref mut password,
                 ref mut server,
+                ref mut error,
                 ..
             } => match message {
                 Message::SetUser(u) => *user = u,
                 Message::SetPassword(p) => *password = p,
                 Message::SetServer(s) => *server = s,
-                Message::Login => (),
+                Message::SetError(e) => *error = Some(e),
+                Message::Login => {
+                    let user = user.clone();
+                    let password = password.clone();
+                    let server = server.clone();
+                    return Command::perform(
+                        async move { matrix::login(&user, &password, &server).await },
+                        |result| match result {
+                            Ok((c, r)) => Message::LoggedIn(c, r),
+                            Err(e) => Message::SetError(e.to_string()),
+                        },
+                    );
+                }
+                Message::LoggedIn(client, session) => *self = Retrix::LoggedIn { client, session },
             },
             _ => (),
         }
+        Command::none()
     }
 
     fn view(&mut self) -> Element<Self::Message> {
@@ -73,8 +100,9 @@ impl Sandbox for Retrix {
                 ref user,
                 ref password,
                 ref server,
+                ref error,
             } => {
-                let content = Column::new()
+                let mut content = Column::new()
                     .width(500.into())
                     .push(Text::new("Username"))
                     .push(
@@ -97,6 +125,9 @@ impl Sandbox for Retrix {
                         .padding(5),
                     )
                     .push(Button::new(login_button, Text::new("Login")).on_press(Message::Login));
+                if let Some(ref error) = error {
+                    content = content.push(Text::new(error).color([1.0, 0.0, 0.0]));
+                }
 
                 Container::new(content)
                     .center_x()
@@ -105,7 +136,10 @@ impl Sandbox for Retrix {
                     .height(iced::Length::Fill)
                     .into()
             }
-            _ => Text::new("Beep").into(),
+            Retrix::LoggedIn {
+                ref client,
+                ref session,
+            } => Text::new(format!("Logged in to {}", session.user_id)).into(),
         }
     }
 }
