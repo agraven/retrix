@@ -1,6 +1,6 @@
 use iced::{
     text_input::{self, TextInput},
-    Application, Button, Column, Command, Container, Element, Length, Row, Text,
+    Application, Button, Column, Command, Container, Element, Length, Scrollable, Text,
 };
 
 use crate::matrix;
@@ -18,35 +18,19 @@ pub enum Retrix {
         server: String,
         error: Option<String>,
     },
+    AwaitLogin,
     LoggedIn {
         client: matrix_sdk::Client,
-        session: matrix_sdk::Session,
+        session: matrix::Session,
 
-        rooms: Vec<matrix_sdk::Room>,
+        rooms: Vec<String>,
+        room_scroll: iced::scrollable::State,
     },
 }
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    // Login form messages
-    SetUser(String),
-    SetPassword(String),
-    SetServer(String),
-    Login,
-    LoggedIn(matrix_sdk::Client, matrix_sdk::Session),
-    SetError(String),
-
-    // Main state messages
-    ResetRooms(Vec<matrix_sdk::Room>),
-}
-
-impl Application for Retrix {
-    type Message = Message;
-    type Executor = iced::executor::Default;
-    type Flags = ();
-
-    fn new(_flags: ()) -> (Self, Command<Self::Message>) {
-        let app = Retrix::Prompt {
+impl Retrix {
+    pub fn new_prompt() -> Retrix {
+        Retrix::Prompt {
             user_input: text_input::State::new(),
             password_input: text_input::State::new(),
             server_input: text_input::State::new(),
@@ -56,8 +40,44 @@ impl Application for Retrix {
             password: String::new(),
             server: String::new(),
             error: None,
-        };
-        (app, Command::none())
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    // Login form messages
+    SetUser(String),
+    SetPassword(String),
+    SetServer(String),
+    Login,
+    LoggedIn(matrix_sdk::Client, matrix::Session),
+    LoginFailed(String),
+
+    // Main state messages
+    ResetRooms(Vec<String>),
+}
+
+impl Application for Retrix {
+    type Message = Message;
+    type Executor = iced::executor::Default;
+    type Flags = ();
+
+    fn new(_flags: ()) -> (Self, Command<Self::Message>) {
+        // Skip login prompt if we have a session saved
+        match matrix::get_session().ok().flatten() {
+            Some(session) => {
+                let command = Command::perform(
+                    async move { matrix::restore_login(session).await },
+                    |result| match result {
+                        Ok((s, c)) => Message::LoggedIn(s, c),
+                        Err(e) => Message::LoginFailed(e.to_string()),
+                    },
+                );
+                (Retrix::AwaitLogin, command)
+            }
+            None => (Retrix::new_prompt(), Command::none()),
+        }
     }
 
     fn title(&self) -> String {
@@ -70,38 +90,47 @@ impl Application for Retrix {
                 ref mut user,
                 ref mut password,
                 ref mut server,
-                ref mut error,
                 ..
             } => match message {
                 Message::SetUser(u) => *user = u,
                 Message::SetPassword(p) => *password = p,
                 Message::SetServer(s) => *server = s,
-                Message::SetError(e) => *error = Some(e),
                 Message::Login => {
                     let user = user.clone();
                     let password = password.clone();
                     let server = server.clone();
+                    *self = Retrix::AwaitLogin;
                     return Command::perform(
                         async move { matrix::login(&user, &password, &server).await },
                         |result| match result {
                             Ok((c, r)) => Message::LoggedIn(c, r),
-                            Err(e) => Message::SetError(e.to_string()),
+                            Err(e) => Message::LoginFailed(e.to_string()),
                         },
                     );
+                }
+                _ => (),
+            },
+            Retrix::AwaitLogin => match message {
+                Message::LoginFailed(e) => {
+                    *self = Retrix::new_prompt();
+                    if let Retrix::Prompt { ref mut error, .. } = *self {
+                        *error = Some(e);
+                    }
                 }
                 Message::LoggedIn(client, session) => {
                     *self = Retrix::LoggedIn {
                         client: client.clone(),
                         session,
                         rooms: Vec::new(),
+                        room_scroll: Default::default(),
                     };
                     let client = client.clone();
-                    Command::perform(
+                    return Command::perform(
                         async move {
                             let mut list = Vec::new();
-                            for (id, room) in client.joined_rooms().read().await.iter() {
-                                let room = room.read().await;
-                                list.push(room.clone());
+                            for (_, room) in client.joined_rooms().read().await.iter() {
+                                let name = room.read().await.display_name();
+                                list.push(name);
                             }
                             list
                         },
@@ -165,11 +194,24 @@ impl Application for Retrix {
                     .height(iced::Length::Fill)
                     .into()
             }
-            Retrix::LoggedIn { ref rooms, .. } => {
+            Retrix::AwaitLogin => Container::new(Text::new("Logging in..."))
+                .center_x()
+                .center_y()
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            Retrix::LoggedIn {
+                ref rooms,
+                ref mut room_scroll,
+                ..
+            } => {
                 //let mut root_row = Row::new().width(Length::Fill).height(Length::Fill);
-                let mut room_col = Column::new().width(400.into()).height(Length::Fill);
+                let mut room_col = Scrollable::new(room_scroll)
+                    .width(400.into())
+                    .height(Length::Fill)
+                    .spacing(15);
                 for room in rooms {
-                    room_col = room_col.push(Text::new(room.display_name()));
+                    room_col = room_col.push(Text::new(room));
                 }
                 room_col.into()
                 //root_row = root_row.push(room_col);
