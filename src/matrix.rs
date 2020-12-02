@@ -1,5 +1,6 @@
 use matrix_sdk::{
-    identifiers::DeviceId, identifiers::UserId, reqwest::Url, Client, ClientConfig, SyncSettings,
+    events::AnyRoomEvent, events::AnySyncRoomEvent, identifiers::DeviceId, identifiers::UserId,
+    reqwest::Url, Client, ClientConfig, LoopCtrl, SyncSettings,
 };
 use serde::{Deserialize, Serialize};
 
@@ -93,4 +94,83 @@ fn write_session(session: &Session) -> Result<(), Error> {
     std::fs::write(session_path(), serialized)?;
 
     Ok(())
+}
+
+pub struct MatrixSync {
+    client: matrix_sdk::Client,
+    //id: String,
+}
+
+impl MatrixSync {
+    pub fn subscription(client: matrix_sdk::Client) -> iced::Subscription<AnyRoomEvent> {
+        iced::Subscription::from_recipe(MatrixSync { client })
+    }
+}
+
+/*#[async_trait]
+impl EventEmitter for Callback {
+    async fn on_room_message(&self, room: SyncRoom, event: &SyncMessageEvent<MessageEventContent>) {
+        let room_id = if let matrix_sdk::RoomState::Joined(arc) = room {
+            let room = arc.read().await;
+            room.room_id.clone()
+        } else {
+            return;
+        };
+        self.sender
+            .send(event.clone().into_full_event(room_id))
+            .ok();
+    }
+}*/
+
+impl<H, I> iced_futures::subscription::Recipe<H, I> for MatrixSync
+where
+    H: std::hash::Hasher,
+{
+    type Output = AnyRoomEvent;
+
+    fn hash(&self, state: &mut H) {
+        use std::hash::Hash;
+
+        std::any::TypeId::of::<Self>().hash(state);
+        //self.id.hash(state);
+    }
+
+    fn stream(
+        self: Box<Self>,
+        _input: iced_futures::BoxStream<I>,
+    ) -> iced_futures::BoxStream<Self::Output> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let client = self.client.clone();
+        tokio::task::spawn(async move {
+            client
+                .sync_with_callback(SyncSettings::new(), |response| async {
+                    for (room_id, room) in response.rooms.join {
+                        for event in room.timeline.events {
+                            if let Ok(event) = event.deserialize() {
+                                let room_id = room_id.clone();
+                                let event = match event {
+                                    AnySyncRoomEvent::Message(e) => {
+                                        AnyRoomEvent::Message(e.into_full_event(room_id))
+                                    }
+                                    AnySyncRoomEvent::State(e) => {
+                                        AnyRoomEvent::State(e.into_full_event(room_id))
+                                    }
+                                    AnySyncRoomEvent::RedactedMessage(e) => {
+                                        AnyRoomEvent::RedactedMessage(e.into_full_event(room_id))
+                                    }
+                                    AnySyncRoomEvent::RedactedState(e) => {
+                                        AnyRoomEvent::RedactedState(e.into_full_event(room_id))
+                                    }
+                                };
+                                sender.send(event).ok();
+                            }
+                        }
+                    }
+
+                    LoopCtrl::Continue
+                })
+                .await;
+        });
+        Box::pin(receiver)
+    }
 }

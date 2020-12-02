@@ -1,3 +1,4 @@
+extern crate crossbeam_channel as channel;
 extern crate dirs_next as dirs;
 
 use std::fs::Permissions;
@@ -16,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::set_permissions(&config_dir, Permissions::from_mode(0o700))?;
     }
 
-    ui::Retrix::run(iced::Settings::default());
+    ui::Retrix::run(iced::Settings::default())?;
 
     Ok(())
 }

@@ -8,10 +8,15 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
+crossbeam-channel = "0.4"
 dirs-next = "2.0"
-iced = { git = "https://github.com/hecrj/iced", rev = "fc4270f", features = ["debug", "tokio"] }
+futures = "0.3"
+iced = { version = "0.2", features = ["debug", "tokio_old"] }
+iced_futures = "0.2"
 hostname = "0.3"
-matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "27c6f30" }
+matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "e65915e" }
+matrix-sdk-common-macros = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "e65915e" }
 serde = { version = "1.0", features = ["derive"] }
-tokio = "0.2"
+tokio = { version = "0.2", features = ["sync"] }
 toml = "0.5"
