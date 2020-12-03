@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use iced::{
     text_input::{self, TextInput},
-    Application, Button, Column, Command, Container, Element, Length, Row, Rule, Scrollable,
+    Application, Button, Column, Command, Container, Element, Length, Radio, Row, Rule, Scrollable,
     Subscription, Text,
 };
 use matrix_sdk::{
     events::{
-        room::message::MessageEventContent, AnyPossiblyRedactedSyncMessageEvent, AnyRoomEvent,
-        AnySyncMessageEvent,
+        room::message::MessageEventContent, AnyMessageEventContent,
+        AnyPossiblyRedactedSyncMessageEvent, AnyRoomEvent, AnySyncMessageEvent,
     },
     identifiers::RoomId,
 };
@@ -26,6 +26,7 @@ pub enum Retrix {
         user: String,
         password: String,
         server: String,
+        action: PromptAction,
         error: Option<String>,
     },
     AwaitLogin(std::time::Instant),
@@ -38,6 +39,10 @@ pub enum Retrix {
         messages: BTreeMap<RoomId, MessageEventContent>,
         selected: Option<RoomId>,
         room_scroll: iced::scrollable::State,
+        message_scroll: iced::scrollable::State,
+        message_input: iced::text_input::State,
+        draft: String,
+        send_button: iced::button::State,
     },
 }
 
@@ -52,9 +57,16 @@ impl Retrix {
             user: String::new(),
             password: String::new(),
             server: String::new(),
+            action: PromptAction::Login,
             error: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptAction {
+    Login,
+    Signup,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +75,10 @@ pub enum Message {
     SetUser(String),
     SetPassword(String),
     SetServer(String),
+    SetAction(PromptAction),
     Login,
+    Signup,
+    // Auth result messages
     LoggedIn(matrix_sdk::Client, matrix::Session),
     LoginFailed(String),
 
@@ -71,6 +86,8 @@ pub enum Message {
     ResetRooms(BTreeMap<RoomId, String>),
     SelectRoom(RoomId),
     Sync(AnyRoomEvent),
+    SetMessage(String),
+    SendMessage,
 }
 
 impl Application for Retrix {
@@ -114,11 +131,13 @@ impl Application for Retrix {
                 user,
                 password,
                 server,
+                action,
                 ..
             } => match message {
                 Message::SetUser(u) => *user = u,
                 Message::SetPassword(p) => *password = p,
                 Message::SetServer(s) => *server = s,
+                Message::SetAction(a) => *action = a,
                 Message::Login => {
                     let user = user.clone();
                     let password = password.clone();
@@ -128,6 +147,19 @@ impl Application for Retrix {
                         async move { matrix::login(&user, &password, &server).await },
                         |result| match result {
                             Ok((c, r)) => Message::LoggedIn(c, r),
+                            Err(e) => Message::LoginFailed(e.to_string()),
+                        },
+                    );
+                }
+                Message::Signup => {
+                    let user = user.clone();
+                    let password = password.clone();
+                    let server = server.clone();
+                    *self = Retrix::AwaitLogin(std::time::Instant::now());
+                    return Command::perform(
+                        async move { matrix::signup(&user, &password, &server).await },
+                        |result| match result {
+                            Ok((client, response)) => Message::LoggedIn(client, response),
                             Err(e) => Message::LoginFailed(e.to_string()),
                         },
                     );
@@ -148,10 +180,14 @@ impl Application for Retrix {
                         rooms: BTreeMap::new(),
                         selected: None,
                         room_scroll: Default::default(),
+                        message_scroll: Default::default(),
+                        message_input: Default::default(),
                         buttons: Default::default(),
                         messages: Default::default(),
+                        draft: String::new(),
+                        send_button: Default::default(),
                     };
-                    let client = client.clone();
+                    /*let client = client.clone();
                     return Command::perform(
                         async move {
                             let mut rooms = BTreeMap::new();
@@ -162,15 +198,48 @@ impl Application for Retrix {
                             rooms
                         },
                         |rooms| Message::ResetRooms(rooms),
-                    );
+                    );*/
                 }
                 _ => (),
             },
             Retrix::LoggedIn {
-                rooms, selected, ..
+                rooms,
+                selected,
+                draft,
+                client,
+                ..
             } => match message {
                 Message::ResetRooms(r) => *rooms = r,
                 Message::SelectRoom(r) => *selected = Some(r),
+                Message::Sync(event) => match event {
+                    AnyRoomEvent::Message(_message) => (),
+                    AnyRoomEvent::State(_state) => (),
+                    AnyRoomEvent::RedactedMessage(_message) => (),
+                    AnyRoomEvent::RedactedState(_state) => (),
+                },
+                Message::SetMessage(m) => *draft = m,
+                Message::SendMessage => {
+                    let selected = selected.to_owned();
+                    let draft = draft.clone();
+                    let client = client.clone();
+                    return Command::perform(
+                        async move {
+                            client
+                                .room_send(
+                                    &selected.unwrap(),
+                                    AnyMessageEventContent::RoomMessage(
+                                        MessageEventContent::text_plain(draft),
+                                    ),
+                                    None,
+                                )
+                                .await
+                        },
+                        |result| match result {
+                            Ok(_) => Message::SetMessage(String::new()),
+                            Err(e) => Message::SetMessage(format!("{:?}", e)),
+                        },
+                    );
+                }
                 _ => (),
             },
         };
@@ -187,11 +256,27 @@ impl Application for Retrix {
                 user,
                 password,
                 server,
+                action,
                 error,
             } => {
                 // Login form
                 let mut content = Column::new()
                     .width(500.into())
+                    .push(
+                        Row::new()
+                            .push(Radio::new(
+                                PromptAction::Login,
+                                "Login",
+                                Some(*action),
+                                Message::SetAction,
+                            ))
+                            .push(Radio::new(
+                                PromptAction::Signup,
+                                "Sign up",
+                                Some(*action),
+                                Message::SetAction,
+                            )),
+                    )
                     .push(Text::new("Username"))
                     .push(TextInput::new(user_input, "Username", user, Message::SetUser).padding(5))
                     .push(Text::new("Password"))
@@ -204,8 +289,22 @@ impl Application for Retrix {
                     .push(
                         TextInput::new(server_input, "Server", server, Message::SetServer)
                             .padding(5),
-                    )
-                    .push(Button::new(login_button, Text::new("Login")).on_press(Message::Login));
+                    );
+                let button = match *action {
+                    PromptAction::Login => {
+                        Button::new(login_button, Text::new("Login")).on_press(Message::Login)
+                    }
+                    PromptAction::Signup => {
+                        content = content.push(
+                            Text::new(
+                                "NB: Signup is very naively implemented, and prone to breaking",
+                            )
+                            .color([0.2, 0.2, 0.0]),
+                        );
+                        Button::new(login_button, Text::new("Sign up")).on_press(Message::Signup)
+                    }
+                };
+                content = content.push(button);
                 if let Some(ref error) = error {
                     content = content.push(Text::new(error).color([1.0, 0.0, 0.0]));
                 }
@@ -234,8 +333,12 @@ impl Application for Retrix {
             Retrix::LoggedIn {
                 client,
                 room_scroll,
+                message_scroll,
+                message_input,
+                send_button,
                 buttons,
                 selected,
+                draft,
                 ..
             } => {
                 let mut root_row = Row::new().width(Length::Fill).height(Length::Fill);
@@ -290,32 +393,66 @@ impl Application for Retrix {
                         .padding(5)
                         .push(Text::new(room.display_name()).size(25))
                         .push(Rule::horizontal(2));
+                    let mut scroll = Scrollable::new(message_scroll)
+                        .scrollbar_width(2)
+                        .height(Length::Fill);
                     for message in room.messages.iter() {
                         if let AnyPossiblyRedactedSyncMessageEvent::Regular(event) = message {
-                            match event {
-                                AnySyncMessageEvent::RoomMessage(room_message) => {
-                                    match &room_message.content {
-                                        MessageEventContent::Text(text) => {
-                                            let row = Row::new()
-                                                .spacing(5)
-                                                .push(
-                                                    Text::new(room_message.sender.localpart())
-                                                        .color([0.2, 0.2, 1.0]),
+                            if let AnySyncMessageEvent::RoomMessage(room_message) = event {
+                                match &room_message.content {
+                                    MessageEventContent::Text(text) => {
+                                        let row = Row::new()
+                                            .spacing(5)
+                                            .push(
+                                                // Render senders disambiguated name or fallback to
+                                                // mxid
+                                                Text::new(
+                                                    room.joined_members
+                                                        .get(&room_message.sender)
+                                                        .map(|sender| sender.disambiguated_name())
+                                                        .unwrap_or(room_message.sender.to_string()),
                                                 )
-                                                .push(Text::new(&text.body).width(Length::Fill))
-                                                .push(Text::new(format_systime(
-                                                    room_message.origin_server_ts,
-                                                )));
-                                            col = col.push(row);
-                                        }
-                                        _ => (),
+                                                .color([0.2, 0.2, 1.0]),
+                                            )
+                                            .push(Text::new(&text.body).width(Length::Fill))
+                                            .push(Text::new(format_systime(
+                                                room_message.origin_server_ts,
+                                            )));
+                                        scroll = scroll.push(row);
                                     }
+                                    _ => (),
                                 }
-                                _ => (),
                             }
                         }
                     }
+                    col = col.push(scroll).push(
+                        Row::new()
+                            .push(
+                                TextInput::new(
+                                    message_input,
+                                    "Write a message...",
+                                    draft,
+                                    Message::SetMessage,
+                                )
+                                .width(Length::Fill)
+                                .padding(5)
+                                .on_submit(Message::SendMessage),
+                            )
+                            .push(
+                                Button::new(send_button, Text::new("Send"))
+                                    .on_press(Message::SendMessage),
+                            ),
+                    );
+
                     root_row = root_row.push(col);
+                } else {
+                    root_row = root_row.push(
+                        Container::new(Text::new("Select a room to start chatting"))
+                            .center_x()
+                            .center_y()
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    );
                 }
 
                 root_row.into()

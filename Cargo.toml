@@ -12,7 +12,7 @@ async-trait = "0.1"
 crossbeam-channel = "0.4"
 dirs-next = "2.0"
 futures = "0.3"
-iced = { version = "0.2", features = ["debug", "tokio_old"] }
+iced = { version = "0.2", features = ["debug", "tokio_old", "image"] }
 iced_futures = "0.2"
 hostname = "0.3"
 matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "e65915e" }
@@ -20,3 +20,4 @@ matrix-sdk-common-macros = { git = "https://github.com/matrix-org/matrix-rust-sd
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "0.2", features = ["sync"] }
 toml = "0.5"
+tracing-subscriber = { version = "0.2", features = ["parking_lot"] }

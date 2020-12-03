@@ -1,6 +1,13 @@
+use std::time::Duration;
+
 use matrix_sdk::{
-    events::AnyRoomEvent, events::AnySyncRoomEvent, identifiers::DeviceId, identifiers::UserId,
-    reqwest::Url, Client, ClientConfig, LoopCtrl, SyncSettings,
+    api::r0::{account::register::Request as RegistrationRequest, uiaa::AuthData},
+    events::AnyRoomEvent,
+    events::AnySyncRoomEvent,
+    identifiers::DeviceId,
+    identifiers::UserId,
+    reqwest::Url,
+    Client, ClientConfig, LoopCtrl, SyncSettings,
 };
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +30,53 @@ impl From<Session> for matrix_sdk::Session {
             device_id: s.device_id,
         }
     }
+}
+
+pub async fn signup(
+    username: &str,
+    password: &str,
+    server: &str,
+) -> Result<(Client, Session), Error> {
+    let url = Url::parse(server)?;
+    let client = client(url)?;
+
+    let mut request = RegistrationRequest::new();
+    request.username = Some(username);
+    request.password = Some(password);
+    request.initial_device_display_name = Some("retrix");
+    request.inhibit_login = false;
+
+    // Get UIAA session key
+    let uiaa = match client.register(request.clone()).await {
+        Err(e) => match e.uiaa_response().cloned() {
+            Some(uiaa) => uiaa,
+            None => return Err(anyhow::anyhow!("Missing UIAA response")),
+        },
+        Ok(_) => {
+            return Err(anyhow::anyhow!("Missing UIAA response"));
+        }
+    };
+    // Get the first step in the authentication flow (we're ignoring the rest)
+    let stages = uiaa.flows.get(0);
+    let kind = stages.and_then(|flow| flow.stages.get(0)).cloned();
+
+    // Set authentication data, fallback to password type
+    request.auth = Some(AuthData::DirectRequest {
+        kind: kind.as_deref().unwrap_or("m.login.password"),
+        session: uiaa.session.as_deref(),
+        auth_parameters: Default::default(),
+    });
+
+    let response = client.register(request).await?;
+
+    let session = Session {
+        access_token: response.access_token.unwrap(),
+        user_id: response.user_id,
+        device_id: response.device_id.unwrap(),
+        homeserver: server.to_owned(),
+    };
+
+    Ok((client, session))
 }
 
 /// Login with credentials, creating a new authentication session
@@ -98,12 +152,13 @@ fn write_session(session: &Session) -> Result<(), Error> {
 
 pub struct MatrixSync {
     client: matrix_sdk::Client,
+    join: Option<tokio::task::JoinHandle<()>>,
     //id: String,
 }
 
 impl MatrixSync {
     pub fn subscription(client: matrix_sdk::Client) -> iced::Subscription<AnyRoomEvent> {
-        iced::Subscription::from_recipe(MatrixSync { client })
+        iced::Subscription::from_recipe(MatrixSync { client, join: None })
     }
 }
 
@@ -136,41 +191,48 @@ where
     }
 
     fn stream(
-        self: Box<Self>,
+        mut self: Box<Self>,
         _input: iced_futures::BoxStream<I>,
     ) -> iced_futures::BoxStream<Self::Output> {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let client = self.client.clone();
-        tokio::task::spawn(async move {
+        let join = tokio::task::spawn(async move {
             client
-                .sync_with_callback(SyncSettings::new(), |response| async {
-                    for (room_id, room) in response.rooms.join {
-                        for event in room.timeline.events {
-                            if let Ok(event) = event.deserialize() {
-                                let room_id = room_id.clone();
-                                let event = match event {
-                                    AnySyncRoomEvent::Message(e) => {
-                                        AnyRoomEvent::Message(e.into_full_event(room_id))
-                                    }
-                                    AnySyncRoomEvent::State(e) => {
-                                        AnyRoomEvent::State(e.into_full_event(room_id))
-                                    }
-                                    AnySyncRoomEvent::RedactedMessage(e) => {
-                                        AnyRoomEvent::RedactedMessage(e.into_full_event(room_id))
-                                    }
-                                    AnySyncRoomEvent::RedactedState(e) => {
-                                        AnyRoomEvent::RedactedState(e.into_full_event(room_id))
-                                    }
-                                };
-                                sender.send(event).ok();
+                .sync_with_callback(
+                    SyncSettings::new().timeout(Duration::from_secs(90)),
+                    |response| async {
+                        for (room_id, room) in response.rooms.join {
+                            for event in room.timeline.events {
+                                if let Ok(event) = event.deserialize() {
+                                    let room_id = room_id.clone();
+                                    let event = match event {
+                                        AnySyncRoomEvent::Message(e) => {
+                                            AnyRoomEvent::Message(e.into_full_event(room_id))
+                                        }
+                                        AnySyncRoomEvent::State(e) => {
+                                            AnyRoomEvent::State(e.into_full_event(room_id))
+                                        }
+                                        AnySyncRoomEvent::RedactedMessage(e) => {
+                                            AnyRoomEvent::RedactedMessage(
+                                                e.into_full_event(room_id),
+                                            )
+                                        }
+                                        AnySyncRoomEvent::RedactedState(e) => {
+                                            AnyRoomEvent::RedactedState(e.into_full_event(room_id))
+                                        }
+                                    };
+                                    sender.send(event).ok();
+                                }
                             }
                         }
-                    }
 
-                    LoopCtrl::Continue
-                })
+                        LoopCtrl::Continue
+                    },
+                )
                 .await;
+            println!("We stopped syncing!");
         });
+        self.join = Some(join);
         Box::pin(receiver)
     }
 }
