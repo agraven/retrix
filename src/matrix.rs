@@ -2,10 +2,8 @@ use std::time::Duration;
 
 use matrix_sdk::{
     api::r0::{account::register::Request as RegistrationRequest, uiaa::AuthData},
-    events::AnyRoomEvent,
-    events::AnySyncRoomEvent,
-    identifiers::DeviceId,
-    identifiers::UserId,
+    events::{AnyRoomEvent, AnySyncRoomEvent, AnyToDeviceEvent},
+    identifiers::{DeviceId, UserId},
     reqwest::Url,
     Client, ClientConfig, LoopCtrl, SyncSettings,
 };
@@ -157,7 +155,7 @@ pub struct MatrixSync {
 }
 
 impl MatrixSync {
-    pub fn subscription(client: matrix_sdk::Client) -> iced::Subscription<AnyRoomEvent> {
+    pub fn subscription(client: matrix_sdk::Client) -> iced::Subscription<Event> {
         iced::Subscription::from_recipe(MatrixSync { client, join: None })
     }
 }
@@ -177,11 +175,17 @@ impl EventEmitter for Callback {
     }
 }*/
 
+#[derive(Clone, Debug)]
+pub enum Event {
+    Room(AnyRoomEvent),
+    ToDevice(AnyToDeviceEvent),
+}
+
 impl<H, I> iced_futures::subscription::Recipe<H, I> for MatrixSync
 where
     H: std::hash::Hasher,
 {
-    type Output = AnyRoomEvent;
+    type Output = Event;
 
     fn hash(&self, state: &mut H) {
         use std::hash::Hash;
@@ -199,31 +203,41 @@ where
         let join = tokio::task::spawn(async move {
             client
                 .sync_with_callback(
-                    SyncSettings::new().timeout(Duration::from_secs(90)),
+                    SyncSettings::new()
+                        .token(client.sync_token().await.unwrap())
+                        .timeout(Duration::from_secs(90))
+                        .full_state(true),
                     |response| async {
-                        for (room_id, room) in response.rooms.join {
+                        for (id, room) in response.rooms.join {
                             for event in room.timeline.events {
-                                if let Ok(event) = event.deserialize() {
-                                    let room_id = room_id.clone();
-                                    let event = match event {
-                                        AnySyncRoomEvent::Message(e) => {
-                                            AnyRoomEvent::Message(e.into_full_event(room_id))
-                                        }
-                                        AnySyncRoomEvent::State(e) => {
-                                            AnyRoomEvent::State(e.into_full_event(room_id))
-                                        }
-                                        AnySyncRoomEvent::RedactedMessage(e) => {
-                                            AnyRoomEvent::RedactedMessage(
-                                                e.into_full_event(room_id),
-                                            )
-                                        }
-                                        AnySyncRoomEvent::RedactedState(e) => {
-                                            AnyRoomEvent::RedactedState(e.into_full_event(room_id))
-                                        }
-                                    };
-                                    sender.send(event).ok();
-                                }
+                                let event = match event.deserialize() {
+                                    Ok(event) => event,
+                                    Err(_) => continue,
+                                };
+                                let id = id.clone();
+                                let event = match event {
+                                    AnySyncRoomEvent::Message(e) => {
+                                        AnyRoomEvent::Message(e.into_full_event(id))
+                                    }
+                                    AnySyncRoomEvent::State(e) => {
+                                        AnyRoomEvent::State(e.into_full_event(id))
+                                    }
+                                    AnySyncRoomEvent::RedactedMessage(e) => {
+                                        AnyRoomEvent::RedactedMessage(e.into_full_event(id))
+                                    }
+                                    AnySyncRoomEvent::RedactedState(e) => {
+                                        AnyRoomEvent::RedactedState(e.into_full_event(id))
+                                    }
+                                };
+                                sender.send(Event::Room(event)).ok();
                             }
+                        }
+                        for event in response.to_device.events {
+                            let event = match event.deserialize() {
+                                Ok(event) => event,
+                                Err(_) => continue,
+                            };
+                            sender.send(Event::ToDevice(event)).ok();
                         }
 
                         LoopCtrl::Continue

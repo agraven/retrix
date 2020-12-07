@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
+use futures::executor::block_on;
 use iced::{
     text_input::{self, TextInput},
     Application, Button, Column, Command, Container, Element, Length, Radio, Row, Rule, Scrollable,
@@ -8,7 +9,7 @@ use iced::{
 use matrix_sdk::{
     events::{
         room::message::MessageEventContent, AnyMessageEventContent,
-        AnyPossiblyRedactedSyncMessageEvent, AnyRoomEvent, AnySyncMessageEvent,
+        AnyPossiblyRedactedSyncMessageEvent, AnySyncMessageEvent, AnyToDeviceEvent,
     },
     identifiers::RoomId,
 };
@@ -111,21 +112,33 @@ impl PromptView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomSorting {
+    Recent,
+    Alphabetic,
+}
+
 /// Main view after successful login
 #[derive(Debug, Clone)]
 pub struct MainView {
+    settings_view: Option<SettingsView>,
     client: matrix_sdk::Client,
     session: matrix::Session,
-
-    rooms: BTreeMap<RoomId, String>,
-    buttons: HashMap<RoomId, iced::button::State>,
-    messages: BTreeMap<RoomId, MessageEventContent>,
+    draft: String,
     selected: Option<RoomId>,
+    sas: Option<matrix_sdk::Sas>,
+    sorting: RoomSorting,
+    rooms: BTreeMap<RoomId, String>,
+    messages: BTreeMap<RoomId, MessageEventContent>,
+
+    buttons: HashMap<RoomId, iced::button::State>,
     room_scroll: iced::scrollable::State,
     message_scroll: iced::scrollable::State,
     message_input: iced::text_input::State,
-    draft: String,
     send_button: iced::button::State,
+    settings_button: iced::button::State,
+    sas_accept_button: iced::button::State,
+    sas_deny_button: iced::button::State,
 }
 
 impl MainView {
@@ -133,6 +146,9 @@ impl MainView {
         Self {
             client,
             session,
+            settings_view: None,
+            settings_button: Default::default(),
+            sas: None,
             rooms: Default::default(),
             selected: None,
             room_scroll: Default::default(),
@@ -142,16 +158,23 @@ impl MainView {
             messages: Default::default(),
             draft: String::new(),
             send_button: Default::default(),
+            sorting: RoomSorting::Alphabetic,
+            sas_accept_button: Default::default(),
+            sas_deny_button: Default::default(),
         }
     }
 
     pub fn view(&mut self) -> Element<Message> {
+        // If settings view is open, display that instead
+        if let Some(ref mut settings) = self.settings_view {
+            return settings.view();
+        }
         let mut root_row = Row::new().width(Length::Fill).height(Length::Fill);
 
         // Room list
         let joined = self.client.joined_rooms();
         let rooms = futures::executor::block_on(async { joined.read().await });
-        let mut room_col = Scrollable::new(&mut self.room_scroll)
+        let mut room_scroll = Scrollable::new(&mut self.room_scroll)
             .width(400.into())
             .height(Length::Fill)
             .scrollbar_width(5);
@@ -163,27 +186,82 @@ impl MainView {
         }
         self.buttons.retain(|id, _| rooms.contains_key(id));
         // Then we make our buttons
-        let buttons: Vec<Button<_>> = self
+        let mut buttons: HashMap<RoomId, Button<Message>> = self
             .buttons
             .iter_mut()
             .map(|(id, state)| {
                 // Get read lock for the room
-                let room =
-                    futures::executor::block_on(async { rooms.get(id).unwrap().read().await });
-                Button::new(state, Text::new(room.display_name()))
+                let room = block_on(async { rooms.get(id).unwrap().read().await });
+                let button = Button::new(state, Text::new(room.display_name()))
                     .on_press(Message::SelectRoom(id.to_owned()))
-                    .width(400.into())
+                    .width(400.into());
+                (id.clone(), button)
             })
             .collect();
-        // Then we add them to our room column. What a mess.
-        for button in buttons {
-            room_col = room_col.push(button);
+        // List of direct message room ids
+        let mut dm_rooms: Vec<&RoomId> = rooms
+            .iter()
+            .filter(|(_, room)| {
+                let read = block_on(async { room.read().await });
+                read.direct_target.is_some()
+            })
+            .map(|(id, _)| id)
+            .collect();
+        // List of non-DM room ids
+        let mut room_rooms = rooms
+            .iter()
+            .filter(|(_, room)| {
+                let read = block_on(async { room.read().await });
+                read.direct_target.is_none()
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for list in [&mut dm_rooms, &mut room_rooms].iter_mut() {
+            match self.sorting {
+                RoomSorting::Recent => list.sort_by_cached_key(|id| {
+                    let read = block_on(async { rooms.get(id).unwrap().read().await });
+                    *read
+                        .messages
+                        .iter()
+                        .map(|msg| match msg {
+                            AnyPossiblyRedactedSyncMessageEvent::Regular(m) => m.origin_server_ts(),
+                            AnyPossiblyRedactedSyncMessageEvent::Redacted(m) => {
+                                m.origin_server_ts()
+                            }
+                        })
+                        .max()
+                        .unwrap_or(&std::time::SystemTime::now())
+                }),
+                RoomSorting::Alphabetic => list.sort_by_cached_key(|id| {
+                    let read = block_on(async { rooms.get(id).unwrap().read().await });
+                    read.display_name().to_uppercase()
+                }),
+            };
         }
+
+        // Add buttons to room column
+        room_scroll = room_scroll.push(Text::new("Direct messages"));
+        for button in dm_rooms.iter().map(|id| buttons.remove(id).unwrap()) {
+            room_scroll = room_scroll.push(button);
+        }
+        room_scroll = room_scroll.push(Text::new("Rooms"));
+        for button in room_rooms.iter().map(|id| buttons.remove(id).unwrap()) {
+            room_scroll = room_scroll.push(button);
+        }
+
+        let room_col = Column::new()
+            .push(
+                Button::new(&mut self.settings_button, Text::new("Settings"))
+                    .on_press(Message::OpenSettings),
+            )
+            .push(room_scroll);
+
         root_row = root_row.push(room_col);
 
         // Messages.
         //
         // Get selected room.
+        let mut message_col = Column::new().spacing(5).padding(5);
         let selected_room = self.selected.as_ref().and_then(|selected| {
             futures::executor::block_on(async {
                 match rooms.get(selected) {
@@ -193,9 +271,7 @@ impl MainView {
             })
         });
         if let Some(room) = selected_room {
-            let mut col = Column::new()
-                .spacing(5)
-                .padding(5)
+            message_col = message_col
                 .push(Text::new(room.display_name()).size(25))
                 .push(Rule::horizontal(2));
             let mut scroll = Scrollable::new(&mut self.message_scroll)
@@ -206,19 +282,17 @@ impl MainView {
                     if let AnySyncMessageEvent::RoomMessage(room_message) = event {
                         match &room_message.content {
                             MessageEventContent::Text(text) => {
+                                // Render senders disambiguated name or fallback to mxid
+                                let sender = Text::new(
+                                    room.joined_members
+                                        .get(&room_message.sender)
+                                        .map(|sender| sender.disambiguated_name())
+                                        .unwrap_or(room_message.sender.to_string()),
+                                )
+                                .color([0.2, 0.2, 1.0]);
                                 let row = Row::new()
                                     .spacing(5)
-                                    .push(
-                                        // Render senders disambiguated name or fallback to
-                                        // mxid
-                                        Text::new(
-                                            room.joined_members
-                                                .get(&room_message.sender)
-                                                .map(|sender| sender.disambiguated_name())
-                                                .unwrap_or(room_message.sender.to_string()),
-                                        )
-                                        .color([0.2, 0.2, 1.0]),
-                                    )
+                                    .push(sender)
                                     .push(Text::new(&text.body).width(Length::Fill))
                                     .push(Text::new(format_systime(room_message.origin_server_ts)));
                                 scroll = scroll.push(row);
@@ -228,28 +302,9 @@ impl MainView {
                     }
                 }
             }
-            col = col.push(scroll).push(
-                Row::new()
-                    .push(
-                        TextInput::new(
-                            &mut self.message_input,
-                            "Write a message...",
-                            &self.draft,
-                            Message::SetMessage,
-                        )
-                        .width(Length::Fill)
-                        .padding(5)
-                        .on_submit(Message::SendMessage),
-                    )
-                    .push(
-                        Button::new(&mut self.send_button, Text::new("Send"))
-                            .on_press(Message::SendMessage),
-                    ),
-            );
-
-            root_row = root_row.push(col);
+            message_col = message_col.push(scroll);
         } else {
-            root_row = root_row.push(
+            message_col = message_col.push(
                 Container::new(Text::new("Select a room to start chatting"))
                     .center_x()
                     .center_y()
@@ -257,6 +312,71 @@ impl MainView {
                     .height(Length::Fill),
             );
         }
+        // Verification info
+        if let Some(ref sas) = self.sas {
+            let device = sas.other_device();
+            let sas_row = match sas.emoji() {
+                Some(emojis) => {
+                    let mut row = Row::new().push(Text::new("Verify emojis match:"));
+                    for (emoji, name) in emojis.iter() {
+                        row = row.push(
+                            Column::new()
+                                .align_items(iced::Align::Center)
+                                .push(Text::new(*emoji).size(32))
+                                .push(Text::new(*name)),
+                        );
+                    }
+                    row.push(
+                        Button::new(&mut self.sas_accept_button, Text::new("Confirm"))
+                            .on_press(Message::VerificationConfirm),
+                    )
+                    .push(
+                        Button::new(&mut self.sas_deny_button, Text::new("Deny"))
+                            .on_press(Message::VerificationCancel),
+                    )
+                }
+                None => Row::new()
+                    .push(
+                        Text::new(format!(
+                            "Incoming verification request from {}",
+                            match device.display_name() {
+                                Some(name) => name,
+                                None => device.device_id().as_str(),
+                            }
+                        ))
+                        .width(Length::Fill),
+                    )
+                    .push(
+                        Button::new(&mut self.sas_accept_button, Text::new("Accept"))
+                            .on_press(Message::VerificationAccept),
+                    )
+                    .push(
+                        Button::new(&mut self.sas_deny_button, Text::new("Cancel"))
+                            .on_press(Message::VerificationCancel),
+                    ),
+            };
+            message_col = message_col.push(sas_row);
+        }
+        // Compose box
+        message_col = message_col.push(
+            Row::new()
+                .push(
+                    TextInput::new(
+                        &mut self.message_input,
+                        "Write a message...",
+                        &self.draft,
+                        Message::SetMessage,
+                    )
+                    .width(Length::Fill)
+                    .padding(5)
+                    .on_submit(Message::SendMessage),
+                )
+                .push(
+                    Button::new(&mut self.send_button, Text::new("Send"))
+                        .on_press(Message::SendMessage),
+                ),
+        );
+        root_row = root_row.push(message_col);
 
         root_row.into()
     }
@@ -297,9 +417,89 @@ pub enum Message {
     // Main state messages
     ResetRooms(BTreeMap<RoomId, String>),
     SelectRoom(RoomId),
-    Sync(AnyRoomEvent),
+    SetVerification(Option<matrix_sdk::Sas>),
+    VerificationAccept,
+    VerificationAccepted,
+    VerificationConfirm,
+    VerificationConfirmed,
+    VerificationCancel,
+    VerificationCancelled,
+
+    Sync(matrix::Event),
     SetMessage(String),
     SendMessage,
+
+    // Settings messages
+    OpenSettings,
+    CloseSettings,
+    /// Set key import path
+    SetKeyPath(String),
+    SetKeyPassword(String),
+    /// Import encryption keys
+    ImportKeys,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct SettingsView {
+    /// Path to import encryption keys from
+    key_path: String,
+    /// Password to decrypt the keys with
+    key_password: String,
+
+    /// Encryption key path entry
+    key_path_input: iced::text_input::State,
+    /// Entry for key password
+    key_password_input: iced::text_input::State,
+    /// Button to import keys
+    key_import_button: iced::button::State,
+    /// Button  to close settings view
+    close_button: iced::button::State,
+}
+
+impl SettingsView {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn view(&mut self) -> Element<Message> {
+        let content = Column::new()
+            .width(500.into())
+            .push(Text::new("Import key (enter path)"))
+            .push(
+                TextInput::new(
+                    &mut self.key_path_input,
+                    "/home/user/exported_keys.txt",
+                    &self.key_path,
+                    Message::SetKeyPath,
+                )
+                .padding(5),
+            )
+            .push(Text::new("Key password"))
+            .push(
+                TextInput::new(
+                    &mut self.key_password_input,
+                    "SecretPassword42",
+                    &self.key_password,
+                    Message::SetKeyPassword,
+                )
+                .password()
+                .padding(5),
+            )
+            .push(
+                Button::new(&mut self.key_import_button, Text::new("Import keys"))
+                    .on_press(Message::ImportKeys),
+            )
+            .push(
+                Button::new(&mut self.close_button, Text::new("Close"))
+                    .on_press(Message::CloseSettings),
+            );
+        Container::new(content)
+            .center_x()
+            .center_y()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
 }
 
 impl Application for Retrix {
@@ -395,40 +595,134 @@ impl Application for Retrix {
                 }
                 _ => (),
             },
-            Retrix::LoggedIn(view) => match message {
-                Message::ResetRooms(r) => view.rooms = r,
-                Message::SelectRoom(r) => view.selected = Some(r),
-                Message::Sync(event) => match event {
-                    AnyRoomEvent::Message(_message) => (),
-                    AnyRoomEvent::State(_state) => (),
-                    AnyRoomEvent::RedactedMessage(_message) => (),
-                    AnyRoomEvent::RedactedState(_state) => (),
-                },
-                Message::SetMessage(m) => view.draft = m,
-                Message::SendMessage => {
-                    let selected = view.selected.to_owned();
-                    let draft = view.draft.clone();
-                    let client = view.client.clone();
-                    return Command::perform(
-                        async move {
-                            client
-                                .room_send(
-                                    &selected.unwrap(),
-                                    AnyMessageEventContent::RoomMessage(
-                                        MessageEventContent::text_plain(draft),
-                                    ),
-                                    None,
-                                )
-                                .await
+            Retrix::LoggedIn(view) => {
+                match message {
+                    Message::ResetRooms(r) => view.rooms = r,
+                    Message::SelectRoom(r) => view.selected = Some(r),
+                    Message::Sync(event) => match event {
+                        matrix::Event::Room(_) => (),
+                        matrix::Event::ToDevice(event) => match event {
+                            /*AnyToDeviceEvent::KeyVerificationRequest(request) => {
+                                let client = view.client.clone();
+                                return Command::perform(
+                                    async move {
+                                        let request = matrix_sdk::api::r0::devi
+                                        client.send(m)
+                                    },
+                                    |sas| Message::SetVerification(sas),
+                                );
+                            }*/
+                            AnyToDeviceEvent::KeyVerificationStart(start) => {
+                                let client = view.client.clone();
+                                return Command::perform(
+                                    async move {
+                                        client.get_verification(&start.content.transaction_id).await
+                                    },
+                                    Message::SetVerification,
+                                );
+                            }
+                            AnyToDeviceEvent::KeyVerificationCancel(cancel) => {
+                                return async { Message::SetMessage(cancel.content.reason) }.into();
+                            }
+                            _ => (),
                         },
-                        |result| match result {
-                            Ok(_) => Message::SetMessage(String::new()),
-                            Err(e) => Message::SetMessage(format!("{:?}", e)),
-                        },
-                    );
+                    },
+                    Message::SetVerification(v) => view.sas = v,
+                    Message::VerificationAccept => {
+                        let sas = match &view.sas {
+                            Some(sas) => sas.clone(),
+                            None => return Command::none(),
+                        };
+                        return Command::perform(async move { sas.accept().await }, |result| {
+                            match result {
+                                Ok(()) => Message::VerificationAccepted,
+                                Err(e) => Message::SetMessage(e.to_string()),
+                            }
+                        });
+                    }
+                    Message::VerificationConfirm => {
+                        let sas = match &view.sas {
+                            Some(sas) => sas.clone(),
+                            None => return Command::none(),
+                        };
+                        return Command::perform(async move { sas.confirm().await }, |result| {
+                            match result {
+                                Ok(()) => Message::VerificationConfirmed,
+                                Err(e) => Message::SetMessage(e.to_string()),
+                            }
+                        });
+                    }
+                    Message::VerificationCancel => {
+                        let sas = match &view.sas {
+                            Some(sas) => sas.clone(),
+                            None => return Command::none(),
+                        };
+                        return Command::perform(async move { sas.cancel().await }, |result| {
+                            match result {
+                                Ok(()) => Message::VerificationCancelled,
+                                Err(e) => Message::SetMessage(e.to_string()),
+                            }
+                        });
+                    }
+                    Message::VerificationCancelled => {
+                        view.sas = None;
+                    }
+                    Message::SetMessage(m) => view.draft = m,
+                    Message::SendMessage => {
+                        let selected = match view.selected.clone() {
+                            Some(selected) => selected,
+                            None => return Command::none(),
+                        };
+                        let draft = view.draft.clone();
+                        let client = view.client.clone();
+                        return Command::perform(
+                            async move {
+                                client
+                                    .room_send(
+                                        &selected,
+                                        AnyMessageEventContent::RoomMessage(
+                                            MessageEventContent::text_plain(draft),
+                                        ),
+                                        None,
+                                    )
+                                    .await
+                            },
+                            |result| match result {
+                                Ok(_) => Message::SetMessage(String::new()),
+                                Err(e) => Message::SetMessage(format!("{:?}", e)),
+                            },
+                        );
+                    }
+                    Message::OpenSettings => view.settings_view = Some(SettingsView::new()),
+                    Message::SetKeyPath(p) => {
+                        if let Some(ref mut settings) = view.settings_view {
+                            settings.key_path = p;
+                        }
+                    }
+                    Message::SetKeyPassword(p) => {
+                        if let Some(ref mut settings) = view.settings_view {
+                            settings.key_password = p;
+                        }
+                    }
+                    Message::ImportKeys => {
+                        if let Some(ref settings) = view.settings_view {
+                            let path = std::path::PathBuf::from(&settings.key_path);
+                            let password = settings.key_password.clone();
+                            let client = view.client.clone();
+                            return Command::perform(
+                                async move { client.import_keys(path, &password).await },
+                                |result| match result {
+                                    Ok(_) => Message::SetKeyPassword(String::new()),
+                                    // TODO: Actual error reporting here
+                                    Err(e) => Message::SetKeyPath(e.to_string()),
+                                },
+                            );
+                        }
+                    }
+                    Message::CloseSettings => view.settings_view = None,
+                    _ => (),
                 }
-                _ => (),
-            },
+            }
         };
         Command::none()
     }
@@ -436,7 +730,7 @@ impl Application for Retrix {
     fn view(&mut self) -> Element<Self::Message> {
         match self {
             Retrix::Prompt(prompt) => prompt.view(),
-            Retrix::AwaitLogin => Container::new(Text::new(format!("Logging in...")))
+            Retrix::AwaitLogin => Container::new(Text::new("Logging in..."))
                 .center_x()
                 .center_y()
                 .width(Length::Fill)
