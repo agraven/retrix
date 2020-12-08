@@ -125,6 +125,7 @@ pub struct MainView {
     client: matrix_sdk::Client,
     session: matrix::Session,
     draft: String,
+    error: Option<(String, iced::button::State)>,
     selected: Option<RoomId>,
     sas: Option<matrix_sdk::Sas>,
     sorting: RoomSorting,
@@ -148,6 +149,7 @@ impl MainView {
             session,
             settings_view: None,
             settings_button: Default::default(),
+            error: None,
             sas: None,
             rooms: Default::default(),
             selected: None,
@@ -417,23 +419,44 @@ pub enum Message {
     // Main state messages
     ResetRooms(BTreeMap<RoomId, String>),
     SelectRoom(RoomId),
+    /// Set error message
+    ErrorMessage(String),
+    /// Close error message
+    ClearError,
     SetVerification(Option<matrix_sdk::Sas>),
+    /// Accept verification flow
     VerificationAccept,
+    /// Accept sent
     VerificationAccepted,
+    /// Confirm keys match
     VerificationConfirm,
+    /// Confirmation sent
     VerificationConfirmed,
+    /// Cancel verification flow
     VerificationCancel,
+    /// Verification flow cancelled
     VerificationCancelled,
-
+    /// Matrix event received
     Sync(matrix::Event),
+    /// Set contents of message compose box
     SetMessage(String),
+    /// Send the contents of the compose box to the selected room
     SendMessage,
 
     // Settings messages
+    /// Open settings menu
     OpenSettings,
+    /// Close settings menu
     CloseSettings,
+    /// Set display name input field
+    SetDisplayNameInput(String),
+    /// Save new display name
+    SaveDisplayName,
+    /// New display name saved successfully
+    DisplayNameSaved,
     /// Set key import path
     SetKeyPath(String),
+    /// Set password key backup is encrypted with
     SetKeyPassword(String),
     /// Import encryption keys
     ImportKeys,
@@ -441,6 +464,14 @@ pub enum Message {
 
 #[derive(Clone, Default, Debug)]
 pub struct SettingsView {
+    /// Display name to set
+    display_name: String,
+
+    /// Display name text input
+    display_name_input: iced::text_input::State,
+    /// Button to set display name
+    display_name_button: iced::button::State,
+
     /// Path to import encryption keys from
     key_path: String,
     /// Password to decrypt the keys with
@@ -464,26 +495,52 @@ impl SettingsView {
     fn view(&mut self) -> Element<Message> {
         let content = Column::new()
             .width(500.into())
-            .push(Text::new("Import key (enter path)"))
+            .spacing(15)
+            .push(Text::new("Profile").size(20))
             .push(
-                TextInput::new(
-                    &mut self.key_path_input,
-                    "/home/user/exported_keys.txt",
-                    &self.key_path,
-                    Message::SetKeyPath,
-                )
-                .padding(5),
+                Column::new().push(Text::new("Display name")).push(
+                    Row::new()
+                        .push(
+                            TextInput::new(
+                                &mut self.display_name_input,
+                                "Alice",
+                                &self.display_name,
+                                Message::SetDisplayNameInput,
+                            )
+                            .width(Length::Fill)
+                            .padding(5),
+                        )
+                        .push(
+                            Button::new(&mut self.display_name_button, Text::new("Save"))
+                                .on_press(Message::SaveDisplayName),
+                        ),
+                ),
             )
-            .push(Text::new("Key password"))
+            .push(Text::new("Encryption").size(20))
             .push(
-                TextInput::new(
-                    &mut self.key_password_input,
-                    "SecretPassword42",
-                    &self.key_password,
-                    Message::SetKeyPassword,
-                )
-                .password()
-                .padding(5),
+                Column::new()
+                    .push(Text::new("Import key (enter path)"))
+                    .push(
+                        TextInput::new(
+                            &mut self.key_path_input,
+                            "/home/user/exported_keys.txt",
+                            &self.key_path,
+                            Message::SetKeyPath,
+                        )
+                        .padding(5),
+                    ),
+            )
+            .push(
+                Column::new().push(Text::new("Key password")).push(
+                    TextInput::new(
+                        &mut self.key_password_input,
+                        "SecretPassword42",
+                        &self.key_password,
+                        Message::SetKeyPassword,
+                    )
+                    .password()
+                    .padding(5),
+                ),
             )
             .push(
                 Button::new(&mut self.key_import_button, Text::new("Import keys"))
@@ -597,21 +654,12 @@ impl Application for Retrix {
             },
             Retrix::LoggedIn(view) => {
                 match message {
+                    Message::ErrorMessage(e) => view.error = Some((e, Default::default())),
                     Message::ResetRooms(r) => view.rooms = r,
                     Message::SelectRoom(r) => view.selected = Some(r),
                     Message::Sync(event) => match event {
                         matrix::Event::Room(_) => (),
                         matrix::Event::ToDevice(event) => match event {
-                            /*AnyToDeviceEvent::KeyVerificationRequest(request) => {
-                                let client = view.client.clone();
-                                return Command::perform(
-                                    async move {
-                                        let request = matrix_sdk::api::r0::devi
-                                        client.send(m)
-                                    },
-                                    |sas| Message::SetVerification(sas),
-                                );
-                            }*/
                             AnyToDeviceEvent::KeyVerificationStart(start) => {
                                 let client = view.client.clone();
                                 return Command::perform(
@@ -694,6 +742,24 @@ impl Application for Retrix {
                         );
                     }
                     Message::OpenSettings => view.settings_view = Some(SettingsView::new()),
+                    Message::SetDisplayNameInput(name) => {
+                        if let Some(ref mut settings) = view.settings_view {
+                            settings.display_name = name;
+                        }
+                    }
+                    Message::SaveDisplayName => {
+                        if let Some(ref mut settings) = view.settings_view {
+                            let client = view.client.clone();
+                            let name = settings.display_name.clone();
+                            return Command::perform(
+                                async move { client.set_display_name(Some(&name)).await },
+                                |result| match result {
+                                    Ok(()) => Message::DisplayNameSaved,
+                                    Err(e) => Message::ErrorMessage(e.to_string()),
+                                },
+                            );
+                        }
+                    }
                     Message::SetKeyPath(p) => {
                         if let Some(ref mut settings) = view.settings_view {
                             settings.key_path = p;
