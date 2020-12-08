@@ -8,6 +8,7 @@ use iced::{
 };
 use matrix_sdk::{
     events::{
+        key::verification::cancel::CancelCode as VerificationCancelCode,
         room::message::MessageEventContent, AnyMessageEventContent,
         AnyPossiblyRedactedSyncMessageEvent, AnySyncMessageEvent, AnyToDeviceEvent,
     },
@@ -19,15 +20,28 @@ use crate::matrix;
 /// View for the login prompt
 #[derive(Debug, Clone, Default)]
 pub struct PromptView {
+    /// Username input field
     user_input: text_input::State,
+    /// Password input field
     password_input: text_input::State,
+    /// Homeserver input field
     server_input: text_input::State,
+    /// Device name input field
+    device_input: text_input::State,
+    /// Button to trigger login
     login_button: iced::button::State,
 
+    /// Username
     user: String,
+    /// Password
     password: String,
+    /// Homeserver
     server: String,
+    /// Device name to create login session under
+    device_name: String,
+    /// Whether to log in or sign up
     action: PromptAction,
+    /// Error message
     error: Option<String>,
 }
 
@@ -39,6 +53,7 @@ impl PromptView {
     pub fn view(&mut self) -> Element<Message> {
         let mut content = Column::new()
             .width(500.into())
+            .spacing(5)
             .push(
                 Row::new()
                     .spacing(15)
@@ -55,36 +70,50 @@ impl PromptView {
                         Message::SetAction,
                     )),
             )
-            .push(Text::new("Username"))
             .push(
-                TextInput::new(
-                    &mut self.user_input,
-                    "Username",
-                    &self.user,
-                    Message::SetUser,
-                )
-                .padding(5),
+                Column::new().push(Text::new("Username")).push(
+                    TextInput::new(
+                        &mut self.user_input,
+                        "Username",
+                        &self.user,
+                        Message::SetUser,
+                    )
+                    .padding(5),
+                ),
             )
-            .push(Text::new("Password"))
             .push(
-                TextInput::new(
-                    &mut self.password_input,
-                    "Password",
-                    &self.password,
-                    Message::SetPassword,
-                )
-                .password()
-                .padding(5),
+                Column::new().push(Text::new("Password")).push(
+                    TextInput::new(
+                        &mut self.password_input,
+                        "Password",
+                        &self.password,
+                        Message::SetPassword,
+                    )
+                    .password()
+                    .padding(5),
+                ),
             )
-            .push(Text::new("Homeserver"))
             .push(
-                TextInput::new(
-                    &mut self.server_input,
-                    "Server",
-                    &self.server,
-                    Message::SetServer,
-                )
-                .padding(5),
+                Column::new().push(Text::new("Homeserver")).push(
+                    TextInput::new(
+                        &mut self.server_input,
+                        "https://homeserver.com",
+                        &self.server,
+                        Message::SetServer,
+                    )
+                    .padding(5),
+                ),
+            )
+            .push(
+                Column::new().push(Text::new("Device name")).push(
+                    TextInput::new(
+                        &mut self.device_input,
+                        "retrix on my laptop",
+                        &self.device_name,
+                        Message::SetDeviceName,
+                    )
+                    .padding(5),
+                ),
             );
         let button = match self.action {
             PromptAction::Login => {
@@ -93,7 +122,7 @@ impl PromptView {
             PromptAction::Signup => {
                 content = content.push(
                     Text::new("NB: Signup is very naively implemented, and prone to breaking")
-                        .color([0.2, 0.2, 0.0]),
+                        .color([1.0, 0.5, 0.0]),
                 );
                 Button::new(&mut self.login_button, Text::new("Sign up")).on_press(Message::Signup)
             }
@@ -121,24 +150,39 @@ pub enum RoomSorting {
 /// Main view after successful login
 #[derive(Debug, Clone)]
 pub struct MainView {
+    /// Settings view, if open
     settings_view: Option<SettingsView>,
+    /// The matrix-sdk client
     client: matrix_sdk::Client,
     session: matrix::Session,
+    /// Draft of message to send
     draft: String,
+    /// Potential error message
     error: Option<(String, iced::button::State)>,
+    /// Selected room
     selected: Option<RoomId>,
+    /// Potential verification flow
     sas: Option<matrix_sdk::Sas>,
+    /// Whether to sort rooms alphabetically or by activity
     sorting: RoomSorting,
     rooms: BTreeMap<RoomId, String>,
     messages: BTreeMap<RoomId, MessageEventContent>,
 
+    /// Room list entry/button to select room
     buttons: HashMap<RoomId, iced::button::State>,
+    /// Room list scrollbar state
     room_scroll: iced::scrollable::State,
+    /// Message view scrollbar state
     message_scroll: iced::scrollable::State,
+    /// Message draft text input
     message_input: iced::text_input::State,
+    /// Button to send drafted message
     send_button: iced::button::State,
+    /// Button to open settings menu
     settings_button: iced::button::State,
+    /// Button for accepting/continuing verification
     sas_accept_button: iced::button::State,
+    /// Button for cancelling verification
     sas_deny_button: iced::button::State,
 }
 
@@ -160,7 +204,7 @@ impl MainView {
             messages: Default::default(),
             draft: String::new(),
             send_button: Default::default(),
-            sorting: RoomSorting::Alphabetic,
+            sorting: RoomSorting::Recent,
             sas_accept_button: Default::default(),
             sas_deny_button: Default::default(),
         }
@@ -169,7 +213,7 @@ impl MainView {
     pub fn view(&mut self) -> Element<Message> {
         // If settings view is open, display that instead
         if let Some(ref mut settings) = self.settings_view {
-            return settings.view();
+            return settings.view(self.sorting);
         }
         let mut root_row = Row::new().width(Length::Fill).height(Length::Fill);
 
@@ -177,7 +221,7 @@ impl MainView {
         let joined = self.client.joined_rooms();
         let rooms = futures::executor::block_on(async { joined.read().await });
         let mut room_scroll = Scrollable::new(&mut self.room_scroll)
-            .width(400.into())
+            .width(300.into())
             .height(Length::Fill)
             .scrollbar_width(5);
         // We have to iterate the buttons map and not the other way around to make the
@@ -220,9 +264,9 @@ impl MainView {
             .collect();
         for list in [&mut dm_rooms, &mut room_rooms].iter_mut() {
             match self.sorting {
-                RoomSorting::Recent => list.sort_by_cached_key(|id| {
+                RoomSorting::Recent => list.sort_by_key(|id| {
                     let read = block_on(async { rooms.get(id).unwrap().read().await });
-                    *read
+                    let time = read
                         .messages
                         .iter()
                         .map(|msg| match msg {
@@ -232,7 +276,14 @@ impl MainView {
                             }
                         })
                         .max()
-                        .unwrap_or(&std::time::SystemTime::now())
+                        .copied();
+                    match time {
+                        Some(time) => time,
+                        None => {
+                            println!("couldn't get time");
+                            std::time::SystemTime::now()
+                        }
+                    }
                 }),
                 RoomSorting::Alphabetic => list.sort_by_cached_key(|id| {
                     let read = block_on(async { rooms.get(id).unwrap().read().await });
@@ -359,6 +410,14 @@ impl MainView {
             };
             message_col = message_col.push(sas_row);
         }
+        // Potential error message
+        if let Some((ref error, ref mut button)) = self.error {
+            message_col = message_col.push(
+                Row::new()
+                    .push(Text::new(error).width(Length::Fill).color([1.0, 0.0, 0.0]))
+                    .push(Button::new(button, Text::new("Close")).on_press(Message::ClearError)),
+            );
+        }
         // Compose box
         message_col = message_col.push(
             Row::new()
@@ -409,6 +468,7 @@ pub enum Message {
     SetUser(String),
     SetPassword(String),
     SetServer(String),
+    SetDeviceName(String),
     SetAction(PromptAction),
     Login,
     Signup,
@@ -423,6 +483,8 @@ pub enum Message {
     ErrorMessage(String),
     /// Close error message
     ClearError,
+    /// Set how the room list is sorted
+    SetSort(RoomSorting),
     SetVerification(Option<matrix_sdk::Sas>),
     /// Accept verification flow
     VerificationAccept,
@@ -435,7 +497,7 @@ pub enum Message {
     /// Cancel verification flow
     VerificationCancel,
     /// Verification flow cancelled
-    VerificationCancelled,
+    VerificationCancelled(VerificationCancelCode),
     /// Matrix event received
     Sync(matrix::Event),
     /// Set contents of message compose box
@@ -466,6 +528,8 @@ pub enum Message {
 pub struct SettingsView {
     /// Display name to set
     display_name: String,
+    /// Are we saving the display name?
+    saving_name: bool,
 
     /// Display name text input
     display_name_input: iced::text_input::State,
@@ -492,11 +556,11 @@ impl SettingsView {
         Self::default()
     }
 
-    fn view(&mut self) -> Element<Message> {
+    fn view(&mut self, sort: RoomSorting) -> Element<Message> {
         let content = Column::new()
             .width(500.into())
-            .spacing(15)
-            .push(Text::new("Profile").size(20))
+            .spacing(5)
+            .push(Text::new("Profile").size(25))
             .push(
                 Column::new().push(Text::new("Display name")).push(
                     Row::new()
@@ -510,13 +574,30 @@ impl SettingsView {
                             .width(Length::Fill)
                             .padding(5),
                         )
-                        .push(
-                            Button::new(&mut self.display_name_button, Text::new("Save"))
+                        .push(match self.saving_name {
+                            false => Button::new(&mut self.display_name_button, Text::new("Save"))
                                 .on_press(Message::SaveDisplayName),
-                        ),
+                            true => {
+                                Button::new(&mut self.display_name_button, Text::new("Saving..."))
+                            }
+                        }),
                 ),
             )
-            .push(Text::new("Encryption").size(20))
+            .push(Text::new("Appearance").size(25))
+            .push(Text::new("Sort messages by:"))
+            .push(Radio::new(
+                RoomSorting::Alphabetic,
+                "Name",
+                Some(sort),
+                Message::SetSort,
+            ))
+            .push(Radio::new(
+                RoomSorting::Recent,
+                "Activity",
+                Some(sort),
+                Message::SetSort,
+            ))
+            .push(Text::new("Encryption").size(25))
             .push(
                 Column::new()
                     .push(Text::new("Import key (enter path)"))
@@ -547,8 +628,10 @@ impl SettingsView {
                     .on_press(Message::ImportKeys),
             )
             .push(
-                Button::new(&mut self.close_button, Text::new("Close"))
-                    .on_press(Message::CloseSettings),
+                Row::new().width(Length::Fill).push(
+                    Button::new(&mut self.close_button, Text::new("Close"))
+                        .on_press(Message::CloseSettings),
+                ),
             );
         Container::new(content)
             .center_x()
@@ -600,14 +683,20 @@ impl Application for Retrix {
                 Message::SetUser(u) => prompt.user = u,
                 Message::SetPassword(p) => prompt.password = p,
                 Message::SetServer(s) => prompt.server = s,
+                Message::SetDeviceName(n) => prompt.device_name = n,
                 Message::SetAction(a) => prompt.action = a,
                 Message::Login => {
                     let user = prompt.user.clone();
                     let password = prompt.password.clone();
                     let server = prompt.server.clone();
+                    let device = prompt.device_name.clone();
+                    let device = match device.is_empty() {
+                        false => Some(device),
+                        true => None,
+                    };
                     *self = Retrix::AwaitLogin;
                     return Command::perform(
-                        async move { matrix::login(&user, &password, &server).await },
+                        async move { matrix::login(&user, &password, &server, device.as_deref()).await },
                         |result| match result {
                             Ok((c, r)) => Message::LoggedIn(c, r),
                             Err(e) => Message::LoginFailed(e.to_string()),
@@ -618,9 +707,16 @@ impl Application for Retrix {
                     let user = prompt.user.clone();
                     let password = prompt.password.clone();
                     let server = prompt.server.clone();
+                    let device = prompt.device_name.clone();
+                    let device = match device.is_empty() {
+                        false => Some(device),
+                        true => None,
+                    };
                     *self = Retrix::AwaitLogin;
                     return Command::perform(
-                        async move { matrix::signup(&user, &password, &server).await },
+                        async move {
+                            matrix::signup(&user, &password, &server, device.as_deref()).await
+                        },
                         |result| match result {
                             Ok((client, response)) => Message::LoggedIn(client, response),
                             Err(e) => Message::LoginFailed(e.to_string()),
@@ -655,6 +751,8 @@ impl Application for Retrix {
             Retrix::LoggedIn(view) => {
                 match message {
                     Message::ErrorMessage(e) => view.error = Some((e, Default::default())),
+                    Message::ClearError => view.error = None,
+                    Message::SetSort(s) => view.sorting = s,
                     Message::ResetRooms(r) => view.rooms = r,
                     Message::SelectRoom(r) => view.selected = Some(r),
                     Message::Sync(event) => match event {
@@ -664,13 +762,18 @@ impl Application for Retrix {
                                 let client = view.client.clone();
                                 return Command::perform(
                                     async move {
+                                        tokio::time::delay_for(std::time::Duration::from_secs(2))
+                                            .await;
                                         client.get_verification(&start.content.transaction_id).await
                                     },
                                     Message::SetVerification,
                                 );
                             }
                             AnyToDeviceEvent::KeyVerificationCancel(cancel) => {
-                                return async { Message::SetMessage(cancel.content.reason) }.into();
+                                return async {
+                                    Message::VerificationCancelled(cancel.content.code)
+                                }
+                                .into();
                             }
                             _ => (),
                         },
@@ -684,7 +787,7 @@ impl Application for Retrix {
                         return Command::perform(async move { sas.accept().await }, |result| {
                             match result {
                                 Ok(()) => Message::VerificationAccepted,
-                                Err(e) => Message::SetMessage(e.to_string()),
+                                Err(e) => Message::ErrorMessage(e.to_string()),
                             }
                         });
                     }
@@ -696,7 +799,7 @@ impl Application for Retrix {
                         return Command::perform(async move { sas.confirm().await }, |result| {
                             match result {
                                 Ok(()) => Message::VerificationConfirmed,
-                                Err(e) => Message::SetMessage(e.to_string()),
+                                Err(e) => Message::ErrorMessage(e.to_string()),
                             }
                         });
                     }
@@ -707,13 +810,17 @@ impl Application for Retrix {
                         };
                         return Command::perform(async move { sas.cancel().await }, |result| {
                             match result {
-                                Ok(()) => Message::VerificationCancelled,
-                                Err(e) => Message::SetMessage(e.to_string()),
+                                Ok(()) => {
+                                    Message::VerificationCancelled(VerificationCancelCode::User)
+                                }
+                                Err(e) => Message::ErrorMessage(e.to_string()),
                             }
                         });
                     }
-                    Message::VerificationCancelled => {
+                    Message::VerificationCancelled(code) => {
                         view.sas = None;
+                        return async move { Message::ErrorMessage(code.as_str().to_owned()) }
+                            .into();
                     }
                     Message::SetMessage(m) => view.draft = m,
                     Message::SendMessage => {
@@ -737,11 +844,24 @@ impl Application for Retrix {
                             },
                             |result| match result {
                                 Ok(_) => Message::SetMessage(String::new()),
-                                Err(e) => Message::SetMessage(format!("{:?}", e)),
+                                Err(e) => Message::ErrorMessage(e.to_string()),
                             },
                         );
                     }
-                    Message::OpenSettings => view.settings_view = Some(SettingsView::new()),
+                    Message::OpenSettings => {
+                        view.settings_view = Some(SettingsView::new());
+                        let client = view.client.clone();
+                        return Command::perform(
+                            async move {
+                                client
+                                    .display_name()
+                                    .await
+                                    .unwrap_or_default()
+                                    .unwrap_or_default()
+                            },
+                            Message::SetDisplayNameInput,
+                        );
+                    }
                     Message::SetDisplayNameInput(name) => {
                         if let Some(ref mut settings) = view.settings_view {
                             settings.display_name = name;
@@ -751,13 +871,20 @@ impl Application for Retrix {
                         if let Some(ref mut settings) = view.settings_view {
                             let client = view.client.clone();
                             let name = settings.display_name.clone();
+                            settings.saving_name = true;
                             return Command::perform(
                                 async move { client.set_display_name(Some(&name)).await },
                                 |result| match result {
                                     Ok(()) => Message::DisplayNameSaved,
-                                    Err(e) => Message::ErrorMessage(e.to_string()),
+                                    // TODO: set saving to false and report error
+                                    Err(_) => Message::DisplayNameSaved,
                                 },
                             );
+                        }
+                    }
+                    Message::DisplayNameSaved => {
+                        if let Some(ref mut settings) = view.settings_view {
+                            settings.saving_name = false;
                         }
                     }
                     Message::SetKeyPath(p) => {

@@ -34,6 +34,7 @@ pub async fn signup(
     username: &str,
     password: &str,
     server: &str,
+    device_name: Option<&str>,
 ) -> Result<(Client, Session), Error> {
     let url = Url::parse(server)?;
     let client = client(url)?;
@@ -41,7 +42,7 @@ pub async fn signup(
     let mut request = RegistrationRequest::new();
     request.username = Some(username);
     request.password = Some(password);
-    request.initial_device_display_name = Some("retrix");
+    request.initial_device_display_name = Some(device_name.unwrap_or("retrix"));
     request.inhibit_login = false;
 
     // Get UIAA session key
@@ -82,6 +83,7 @@ pub async fn login(
     username: &str,
     password: &str,
     server: &str,
+    device_name: Option<&str>,
 ) -> Result<(Client, Session), Error> {
     let url = Url::parse(server)?;
     let client = client(url)?;
@@ -91,7 +93,7 @@ pub async fn login(
             username,
             password,
             None,
-            Some(&format!("retrix@{}", hostname::get()?.to_string_lossy())),
+            Some(device_name.unwrap_or("retrix")),
         )
         .await?;
     let session = Session {
