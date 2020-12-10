@@ -168,7 +168,7 @@ pub enum RoomSorting {
 }
 
 /// Data for en entry in the room list
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RoomEntry {
     /// Cached calculated name
     name: String,
@@ -182,8 +182,6 @@ pub struct RoomEntry {
     direct: Option<UserId>,
     /// Button to select the room
     button: iced::button::State,
-    /// Most recent activity in the room
-    updated: std::time::SystemTime,
     /// Cache of messages
     messages: MessageBuffer,
 }
@@ -203,34 +201,26 @@ impl RoomEntry {
     }
 }
 
-impl Default for RoomEntry {
-    fn default() -> Self {
-        Self {
-            name: Default::default(),
-            topic: String::new(),
-            alias: None,
-            display_name: None,
-            direct: None,
-            button: Default::default(),
-            updated: std::time::SystemTime::UNIX_EPOCH,
-            messages: Default::default(),
-        }
-    }
-}
-
-impl RoomEntry {
-    fn update_time(&mut self) {
-        self.updated = self.messages.update_time();
-    }
-}
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MessageBuffer {
     messages: VecDeque<AnyRoomEvent>,
     /// Token for the start of the messages we have
     start: String,
     /// Token for the end of the messages we have
     end: String,
+    /// Most recent activity in the room
+    updated: std::time::SystemTime,
+}
+
+impl Default for MessageBuffer {
+    fn default() -> Self {
+        Self {
+            messages: Default::default(),
+            start: String::new(),
+            end: String::new(),
+            updated: SystemTime::UNIX_EPOCH,
+        }
+    }
 }
 
 impl MessageBuffer {
@@ -242,21 +232,23 @@ impl MessageBuffer {
     }
 
     /// Gets the send time of the most recently sent message
-    fn update_time(&self) -> SystemTime {
-        match self.messages.back() {
+    fn update_time(&mut self) {
+        self.updated = match self.messages.back() {
             Some(message) => message.origin_server_ts(),
             None => SystemTime::UNIX_EPOCH,
-        }
+        };
     }
     /// Insert a message that's probably the most recent
     pub fn push_back(&mut self, event: AnyRoomEvent) {
         self.messages.push_back(event);
         self.sort();
+        self.update_time();
     }
 
     pub fn push_front(&mut self, event: AnyRoomEvent) {
         self.messages.push_front(event);
         self.sort();
+        self.update_time();
     }
 }
 
@@ -900,23 +892,28 @@ impl Application for Retrix {
                         matrix::Event::Room(event) => match event {
                             AnyRoomEvent::Message(event) => {
                                 let room = view.rooms.entry(event.room_id().clone()).or_default();
-                                room.messages
-                                    .push_back(AnyRoomEvent::Message(event.clone()));
+                                room.messages.push_back(AnyRoomEvent::Message(event));
                             }
                             AnyRoomEvent::State(event) => match event {
-                                AnyStateEvent::RoomCanonicalAlias(alias) => {
-                                    let room = view.rooms.entry(alias.room_id).or_default();
-                                    room.alias = alias.content.alias;
+                                AnyStateEvent::RoomCanonicalAlias(ref alias) => {
+                                    let room = view.rooms.entry(alias.room_id.clone()).or_default();
+                                    room.alias = alias.content.alias.clone();
+                                    room.messages.push_back(AnyRoomEvent::State(event));
                                 }
-                                AnyStateEvent::RoomName(name) => {
-                                    let room = view.rooms.entry(name.room_id).or_default();
+                                AnyStateEvent::RoomName(ref name) => {
+                                    let room = view.rooms.entry(name.room_id.clone()).or_default();
                                     room.display_name = name.content.name().map(String::from);
+                                    room.messages.push_back(AnyRoomEvent::State(event));
                                 }
-                                AnyStateEvent::RoomTopic(topic) => {
-                                    let room = view.rooms.entry(topic.room_id).or_default();
+                                AnyStateEvent::RoomTopic(ref topic) => {
+                                    let room = view.rooms.entry(topic.room_id.clone()).or_default();
+                                    room.topic = topic.content.topic.clone();
+                                    room.messages.push_back(AnyRoomEvent::State(event));
                                 }
-                                any => {
+                                ref any => {
+                                    // Ensure room exists
                                     let room = view.rooms.entry(any.room_id().clone()).or_default();
+                                    room.messages.push_back(AnyRoomEvent::State(event));
                                 }
                             },
                             _ => (),
