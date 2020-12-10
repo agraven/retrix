@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    time::SystemTime,
+};
 
 use futures::executor::block_on;
 use iced::{
@@ -10,12 +13,29 @@ use matrix_sdk::{
     events::{
         key::verification::cancel::CancelCode as VerificationCancelCode,
         room::message::MessageEventContent, AnyMessageEventContent,
-        AnyPossiblyRedactedSyncMessageEvent, AnySyncMessageEvent, AnyToDeviceEvent,
+        AnyPossiblyRedactedSyncMessageEvent, AnyRoomEvent, AnyStateEvent, AnySyncMessageEvent,
+        AnyToDeviceEvent,
     },
-    identifiers::RoomId,
+    identifiers::{RoomAliasId, RoomId, UserId},
 };
 
 use crate::matrix;
+
+pub trait AnyRoomEventExt {
+    fn origin_server_ts(&self) -> SystemTime;
+}
+
+impl AnyRoomEventExt for AnyRoomEvent {
+    fn origin_server_ts(&self) -> SystemTime {
+        match self {
+            AnyRoomEvent::Message(e) => e.origin_server_ts(),
+            AnyRoomEvent::State(e) => e.origin_server_ts(),
+            AnyRoomEvent::RedactedMessage(e) => e.origin_server_ts(),
+            AnyRoomEvent::RedactedState(e) => e.origin_server_ts(),
+        }
+        .to_owned()
+    }
+}
 
 /// View for the login prompt
 #[derive(Debug, Clone, Default)]
@@ -147,6 +167,99 @@ pub enum RoomSorting {
     Alphabetic,
 }
 
+/// Data for en entry in the room list
+#[derive(Clone, Debug)]
+pub struct RoomEntry {
+    /// Cached calculated name
+    name: String,
+    /// Room topic
+    topic: String,
+    /// Canonical alias
+    alias: Option<RoomAliasId>,
+    /// Defined display name
+    display_name: Option<String>,
+    /// Person we're in a direct message with
+    direct: Option<UserId>,
+    /// Button to select the room
+    button: iced::button::State,
+    /// Most recent activity in the room
+    updated: std::time::SystemTime,
+    /// Cache of messages
+    messages: MessageBuffer,
+}
+
+impl RoomEntry {
+    /// Recalculate displayname
+    pub fn update_display_name(&mut self, id: &RoomId) {
+        self.name = if let Some(ref name) = self.display_name {
+            name.to_owned()
+        } else if let Some(ref user) = self.direct {
+            user.to_string()
+        } else if let Some(ref alias) = self.alias {
+            alias.to_string()
+        } else {
+            id.to_string()
+        };
+    }
+}
+
+impl Default for RoomEntry {
+    fn default() -> Self {
+        Self {
+            name: Default::default(),
+            topic: String::new(),
+            alias: None,
+            display_name: None,
+            direct: None,
+            button: Default::default(),
+            updated: std::time::SystemTime::UNIX_EPOCH,
+            messages: Default::default(),
+        }
+    }
+}
+
+impl RoomEntry {
+    fn update_time(&mut self) {
+        self.updated = self.messages.update_time();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MessageBuffer {
+    messages: VecDeque<AnyRoomEvent>,
+    /// Token for the start of the messages we have
+    start: String,
+    /// Token for the end of the messages we have
+    end: String,
+}
+
+impl MessageBuffer {
+    /// Sorts the messages by send time
+    fn sort(&mut self) {
+        self.messages
+            .make_contiguous()
+            .sort_unstable_by(|a, b| a.origin_server_ts().cmp(&b.origin_server_ts()).reverse())
+    }
+
+    /// Gets the send time of the most recently sent message
+    fn update_time(&self) -> SystemTime {
+        match self.messages.back() {
+            Some(message) => message.origin_server_ts(),
+            None => SystemTime::UNIX_EPOCH,
+        }
+    }
+    /// Insert a message that's probably the most recent
+    pub fn push_back(&mut self, event: AnyRoomEvent) {
+        self.messages.push_back(event);
+        self.sort();
+    }
+
+    pub fn push_front(&mut self, event: AnyRoomEvent) {
+        self.messages.push_front(event);
+        self.sort();
+    }
+}
+
 /// Main view after successful login
 #[derive(Debug, Clone)]
 pub struct MainView {
@@ -165,8 +278,7 @@ pub struct MainView {
     sas: Option<matrix_sdk::Sas>,
     /// Whether to sort rooms alphabetically or by activity
     sorting: RoomSorting,
-    rooms: BTreeMap<RoomId, String>,
-    messages: BTreeMap<RoomId, MessageEventContent>,
+    rooms: BTreeMap<RoomId, RoomEntry>,
 
     /// Room list entry/button to select room
     buttons: HashMap<RoomId, iced::button::State>,
@@ -201,10 +313,9 @@ impl MainView {
             message_scroll: Default::default(),
             message_input: Default::default(),
             buttons: Default::default(),
-            messages: Default::default(),
             draft: String::new(),
             send_button: Default::default(),
-            sorting: RoomSorting::Recent,
+            sorting: RoomSorting::Alphabetic,
             sas_accept_button: Default::default(),
             sas_deny_button: Default::default(),
         }
@@ -275,14 +386,11 @@ impl MainView {
                                 m.origin_server_ts()
                             }
                         })
-                        .max()
+                        .min()
                         .copied();
                     match time {
                         Some(time) => time,
-                        None => {
-                            println!("couldn't get time");
-                            std::time::SystemTime::now()
-                        }
+                        None => std::time::SystemTime::now(),
                     }
                 }),
                 RoomSorting::Alphabetic => list.sort_by_cached_key(|id| {
@@ -369,6 +477,9 @@ impl MainView {
         if let Some(ref sas) = self.sas {
             let device = sas.other_device();
             let sas_row = match sas.emoji() {
+                _ if sas.is_done() => {
+                    Row::new().push(Text::new("Verification complete").width(Length::Fill))
+                }
                 Some(emojis) => {
                     let mut row = Row::new().push(Text::new("Verify emojis match:"));
                     for (emoji, name) in emojis.iter() {
@@ -477,7 +588,7 @@ pub enum Message {
     LoginFailed(String),
 
     // Main state messages
-    ResetRooms(BTreeMap<RoomId, String>),
+    ResetRooms(BTreeMap<RoomId, RoomEntry>),
     SelectRoom(RoomId),
     /// Set error message
     ErrorMessage(String),
@@ -732,19 +843,49 @@ impl Application for Retrix {
                     *self = Retrix::Prompt(view);
                 }
                 Message::LoggedIn(client, session) => {
-                    *self = Retrix::LoggedIn(MainView::new(client, session));
-                    /*let client = client.clone();
+                    *self = Retrix::LoggedIn(MainView::new(client.clone(), session));
                     return Command::perform(
                         async move {
-                            let mut rooms = BTreeMap::new();
+                            let mut rooms: BTreeMap<RoomId, RoomEntry> = BTreeMap::new();
                             for (id, room) in client.joined_rooms().read().await.iter() {
-                                let name = room.read().await.display_name();
-                                rooms.insert(id.to_owned(), name);
+                                let room = room.read().await;
+                                let entry = rooms.entry(id.clone()).or_default();
+
+                                entry.direct = room.direct_target.clone();
+                                // Display name calculation for DMs is bronk so we're doing it
+                                // ourselves
+                                match entry.direct {
+                                    Some(ref direct) => {
+                                        let request = matrix_sdk::api::r0::profile::get_display_name::Request::new(direct);
+                                        if let Ok(response) = client.send(request).await {
+                                            if let Some(name) = response.displayname {
+                                                entry.name = name;
+                                            }
+                                        }
+                                    }
+                                    None => entry.name = room.display_name(),
+                                }
+                                let messages = room
+                                    .messages
+                                    .iter()
+                                    .cloned()
+                                    .map(|event| match event {
+                                        AnyPossiblyRedactedSyncMessageEvent::Redacted(e) => {
+                                            AnyRoomEvent::RedactedMessage(
+                                                e.into_full_event(id.clone()),
+                                            )
+                                        }
+                                        AnyPossiblyRedactedSyncMessageEvent::Regular(e) => {
+                                            AnyRoomEvent::Message(e.into_full_event(id.clone()))
+                                        }
+                                    })
+                                    .collect();
+                                entry.messages.messages = messages;
                             }
                             rooms
                         },
-                        |rooms| Message::ResetRooms(rooms),
-                    );*/
+                        Message::ResetRooms,
+                    );
                 }
                 _ => (),
             },
@@ -756,7 +897,30 @@ impl Application for Retrix {
                     Message::ResetRooms(r) => view.rooms = r,
                     Message::SelectRoom(r) => view.selected = Some(r),
                     Message::Sync(event) => match event {
-                        matrix::Event::Room(_) => (),
+                        matrix::Event::Room(event) => match event {
+                            AnyRoomEvent::Message(event) => {
+                                let room = view.rooms.entry(event.room_id().clone()).or_default();
+                                room.messages
+                                    .push_back(AnyRoomEvent::Message(event.clone()));
+                            }
+                            AnyRoomEvent::State(event) => match event {
+                                AnyStateEvent::RoomCanonicalAlias(alias) => {
+                                    let room = view.rooms.entry(alias.room_id).or_default();
+                                    room.alias = alias.content.alias;
+                                }
+                                AnyStateEvent::RoomName(name) => {
+                                    let room = view.rooms.entry(name.room_id).or_default();
+                                    room.display_name = name.content.name().map(String::from);
+                                }
+                                AnyStateEvent::RoomTopic(topic) => {
+                                    let room = view.rooms.entry(topic.room_id).or_default();
+                                }
+                                any => {
+                                    let room = view.rooms.entry(any.room_id().clone()).or_default();
+                                }
+                            },
+                            _ => (),
+                        },
                         matrix::Event::ToDevice(event) => match event {
                             AnyToDeviceEvent::KeyVerificationStart(start) => {
                                 let client = view.client.clone();
