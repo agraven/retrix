@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     time::SystemTime,
 };
 
@@ -12,9 +12,8 @@ use iced::{
 use matrix_sdk::{
     events::{
         key::verification::cancel::CancelCode as VerificationCancelCode,
-        room::message::MessageEventContent, AnyMessageEventContent,
-        AnyPossiblyRedactedSyncMessageEvent, AnyRoomEvent, AnyStateEvent, AnySyncMessageEvent,
-        AnyToDeviceEvent,
+        room::message::MessageEventContent, AnyMessageEvent, AnyMessageEventContent,
+        AnyPossiblyRedactedSyncMessageEvent, AnyRoomEvent, AnyStateEvent, AnyToDeviceEvent,
     },
     identifiers::{RoomAliasId, RoomId, UserId},
 };
@@ -180,8 +179,6 @@ pub struct RoomEntry {
     display_name: Option<String>,
     /// Person we're in a direct message with
     direct: Option<UserId>,
-    /// Button to select the room
-    button: iced::button::State,
     /// Cache of messages
     messages: MessageBuffer,
 }
@@ -228,7 +225,7 @@ impl MessageBuffer {
     fn sort(&mut self) {
         self.messages
             .make_contiguous()
-            .sort_unstable_by(|a, b| a.origin_server_ts().cmp(&b.origin_server_ts()).reverse())
+            .sort_unstable_by(|a, b| a.origin_server_ts().cmp(&b.origin_server_ts()))
     }
 
     /// Gets the send time of the most recently sent message
@@ -273,7 +270,9 @@ pub struct MainView {
     rooms: BTreeMap<RoomId, RoomEntry>,
 
     /// Room list entry/button to select room
-    buttons: HashMap<RoomId, iced::button::State>,
+    dm_buttons: Vec<iced::button::State>,
+    ///
+    group_buttons: Vec<iced::button::State>,
     /// Room list scrollbar state
     room_scroll: iced::scrollable::State,
     /// Message view scrollbar state
@@ -304,7 +303,8 @@ impl MainView {
             room_scroll: Default::default(),
             message_scroll: Default::default(),
             message_input: Default::default(),
-            buttons: Default::default(),
+            dm_buttons: Vec::new(),
+            group_buttons: Vec::new(),
             draft: String::new(),
             send_button: Default::default(),
             sorting: RoomSorting::Alphabetic,
@@ -320,85 +320,65 @@ impl MainView {
         }
         let mut root_row = Row::new().width(Length::Fill).height(Length::Fill);
 
-        // Room list
-        let joined = self.client.joined_rooms();
-        let rooms = futures::executor::block_on(async { joined.read().await });
         let mut room_scroll = Scrollable::new(&mut self.room_scroll)
             .width(300.into())
             .height(Length::Fill)
             .scrollbar_width(5);
-        // We have to iterate the buttons map and not the other way around to make the
-        // borrow checker happy. First we make sure there's a button entry for every room
-        // entry, and clean up button entries from removed rooms.
-        for (id, _) in rooms.iter() {
-            self.buttons.entry(id.to_owned()).or_default();
-        }
-        self.buttons.retain(|id, _| rooms.contains_key(id));
-        // Then we make our buttons
-        let mut buttons: HashMap<RoomId, Button<Message>> = self
-            .buttons
-            .iter_mut()
-            .map(|(id, state)| {
-                // Get read lock for the room
-                let room = block_on(async { rooms.get(id).unwrap().read().await });
-                let button = Button::new(state, Text::new(room.display_name()))
-                    .on_press(Message::SelectRoom(id.to_owned()))
-                    .width(400.into());
-                (id.clone(), button)
-            })
-            .collect();
-        // List of direct message room ids
-        let mut dm_rooms: Vec<&RoomId> = rooms
+
+        // Group by DM and group conversation
+        let (mut dm_rooms, mut group_rooms): (
+            Vec<(&RoomId, &RoomEntry)>,
+            Vec<(&RoomId, &RoomEntry)>,
+        ) = self
+            .rooms
             .iter()
-            .filter(|(_, room)| {
-                let read = block_on(async { room.read().await });
-                read.direct_target.is_some()
-            })
-            .map(|(id, _)| id)
-            .collect();
-        // List of non-DM room ids
-        let mut room_rooms = rooms
-            .iter()
-            .filter(|(_, room)| {
-                let read = block_on(async { room.read().await });
-                read.direct_target.is_none()
-            })
-            .map(|(id, _)| id)
-            .collect();
-        for list in [&mut dm_rooms, &mut room_rooms].iter_mut() {
+            .partition(|(_, room)| room.direct.is_some());
+        // Sort
+        for list in [&mut dm_rooms, &mut group_rooms].iter_mut() {
             match self.sorting {
-                RoomSorting::Recent => list.sort_by_key(|id| {
-                    let read = block_on(async { rooms.get(id).unwrap().read().await });
-                    let time = read
-                        .messages
-                        .iter()
-                        .map(|msg| match msg {
-                            AnyPossiblyRedactedSyncMessageEvent::Regular(m) => m.origin_server_ts(),
-                            AnyPossiblyRedactedSyncMessageEvent::Redacted(m) => {
-                                m.origin_server_ts()
-                            }
-                        })
-                        .min()
-                        .copied();
-                    match time {
-                        Some(time) => time,
-                        None => std::time::SystemTime::now(),
-                    }
+                RoomSorting::Alphabetic => list.sort_unstable_by(|(_, a), (_, b)| {
+                    a.name.to_uppercase().cmp(&b.name.to_uppercase())
                 }),
-                RoomSorting::Alphabetic => list.sort_by_cached_key(|id| {
-                    let read = block_on(async { rooms.get(id).unwrap().read().await });
-                    read.display_name().to_uppercase()
+                RoomSorting::Recent => list.sort_unstable_by(|(_, a), (_, b)| {
+                    a.messages.updated.cmp(&b.messages.updated).reverse()
                 }),
             };
         }
-
-        // Add buttons to room column
+        self.dm_buttons
+            .resize_with(dm_rooms.len(), Default::default);
+        self.group_buttons
+            .resize_with(group_rooms.len(), Default::default);
+        // Create buttons
+        let dm_buttons: Vec<Button<_>> = self
+            .dm_buttons
+            .iter_mut()
+            .enumerate()
+            .map(|(idx, button)| {
+                // TODO: highlight selected
+                let (id, room) = dm_rooms[idx];
+                Button::new(button, Text::new(&room.name))
+                    .width(300.into())
+                    .on_press(Message::SelectRoom(id.clone().clone()))
+            })
+            .collect();
+        let room_buttons: Vec<Button<_>> = self
+            .group_buttons
+            .iter_mut()
+            .enumerate()
+            .map(|(idx, button)| {
+                let (id, room) = group_rooms[idx];
+                Button::new(button, Text::new(&room.name))
+                    .width(300.into())
+                    .on_press(Message::SelectRoom(id.clone()))
+            })
+            .collect();
+        // Add buttons to container
         room_scroll = room_scroll.push(Text::new("Direct messages"));
-        for button in dm_rooms.iter().map(|id| buttons.remove(id).unwrap()) {
+        for button in dm_buttons.into_iter() {
             room_scroll = room_scroll.push(button);
         }
         room_scroll = room_scroll.push(Text::new("Rooms"));
-        for button in room_rooms.iter().map(|id| buttons.remove(id).unwrap()) {
+        for button in room_buttons.into_iter() {
             room_scroll = room_scroll.push(button);
         }
 
@@ -408,51 +388,84 @@ impl MainView {
                     .on_press(Message::OpenSettings),
             )
             .push(room_scroll);
-
         root_row = root_row.push(room_col);
 
-        // Messages.
-        //
-        // Get selected room.
         let mut message_col = Column::new().spacing(5).padding(5);
-        let selected_room = self.selected.as_ref().and_then(|selected| {
-            futures::executor::block_on(async {
-                match rooms.get(selected) {
-                    Some(room) => Some(room.read().await),
-                    None => None,
-                }
-            })
-        });
+        let selected_room = match self.selected {
+            Some(ref selected) => self.rooms.get(selected),
+            None => None,
+        };
         if let Some(room) = selected_room {
             message_col = message_col
-                .push(Text::new(room.display_name()).size(25))
+                .push(Text::new(&room.name).size(25))
                 .push(Rule::horizontal(2));
             let mut scroll = Scrollable::new(&mut self.message_scroll)
                 .scrollbar_width(2)
                 .height(Length::Fill);
-            for message in room.messages.iter() {
-                if let AnyPossiblyRedactedSyncMessageEvent::Regular(event) = message {
-                    if let AnySyncMessageEvent::RoomMessage(room_message) = event {
-                        match &room_message.content {
-                            MessageEventContent::Text(text) => {
-                                // Render senders disambiguated name or fallback to mxid
-                                let sender = Text::new(
-                                    room.joined_members
-                                        .get(&room_message.sender)
-                                        .map(|sender| sender.disambiguated_name())
-                                        .unwrap_or(room_message.sender.to_string()),
-                                )
-                                .color([0.2, 0.2, 1.0]);
-                                let row = Row::new()
-                                    .spacing(5)
-                                    .push(sender)
-                                    .push(Text::new(&text.body).width(Length::Fill))
-                                    .push(Text::new(format_systime(room_message.origin_server_ts)));
-                                scroll = scroll.push(row);
+            for event in room.messages.messages.iter() {
+                match event {
+                    AnyRoomEvent::Message(AnyMessageEvent::RoomMessage(message)) => {
+                        let sender = {
+                            let joined = self.client.joined_rooms();
+                            let rooms_lock = block_on(async { joined.read().await });
+                            match rooms_lock.get(&message.room_id) {
+                                Some(backend) => {
+                                    let room_lock = block_on(async { backend.read().await });
+                                    match room_lock.joined_members.get(&message.sender) {
+                                        Some(member) => member.disambiguated_name(),
+                                        None => message.sender.to_string(),
+                                    }
+                                }
+                                None => message.sender.to_string(),
                             }
-                            _ => (),
-                        }
+                        };
+                        let content: Element<_> = match &message.content {
+                            MessageEventContent::Audio(audio) => {
+                                Text::new(format!("Audio message: {}", audio.body))
+                                    .color([0.2, 0.2, 0.2])
+                                    .width(Length::Fill)
+                                    .into()
+                            }
+                            MessageEventContent::Emote(emote) => {
+                                Text::new(format!("{} {}", sender, emote.body))
+                                    .width(Length::Fill)
+                                    .into()
+                            }
+                            MessageEventContent::File(file) => {
+                                Text::new(format!("File '{}'", file.body))
+                                    .color([0.2, 0.2, 0.2])
+                                    .width(Length::Fill)
+                                    .into()
+                            }
+                            MessageEventContent::Image(image) => {
+                                Text::new(format!("Image with description: {}", image.body))
+                                    .width(Length::Fill)
+                                    .into()
+                            }
+                            MessageEventContent::Notice(notice) => {
+                                Text::new(&notice.body).width(Length::Fill).into()
+                            }
+                            MessageEventContent::ServerNotice(notice) => {
+                                Text::new(&notice.body).width(Length::Fill).into()
+                            }
+                            MessageEventContent::Text(text) => {
+                                Text::new(&text.body).width(Length::Fill).into()
+                            }
+                            MessageEventContent::Video(video) => {
+                                Text::new(format!("Video: {}", video.body))
+                                    .color([0.2, 0.2, 0.2])
+                                    .into()
+                            }
+                            _ => Text::new("Unknown message type").into(),
+                        };
+                        let row = Row::new()
+                            .spacing(5)
+                            .push(Text::new(sender).color([0.0, 0.0, 1.0]))
+                            .push(content)
+                            .push(Text::new(format_systime(message.origin_server_ts)));
+                        scroll = scroll.push(row);
                     }
+                    _ => (),
                 }
             }
             message_col = message_col.push(scroll);
@@ -469,9 +482,12 @@ impl MainView {
         if let Some(ref sas) = self.sas {
             let device = sas.other_device();
             let sas_row = match sas.emoji() {
-                _ if sas.is_done() => {
-                    Row::new().push(Text::new("Verification complete").width(Length::Fill))
-                }
+                _ if sas.is_done() => Row::new()
+                    .push(Text::new("Verification complete").width(Length::Fill))
+                    .push(
+                        Button::new(&mut self.sas_accept_button, Text::new("Close"))
+                            .on_press(Message::VerificationClose),
+                    ),
                 Some(emojis) => {
                     let mut row = Row::new().push(Text::new("Verify emojis match:"));
                     for (emoji, name) in emojis.iter() {
@@ -601,6 +617,8 @@ pub enum Message {
     VerificationCancel,
     /// Verification flow cancelled
     VerificationCancelled(VerificationCancelCode),
+    /// Close verification bar
+    VerificationClose,
     /// Matrix event received
     Sync(matrix::Event),
     /// Set contents of message compose box
@@ -983,6 +1001,7 @@ impl Application for Retrix {
                         return async move { Message::ErrorMessage(code.as_str().to_owned()) }
                             .into();
                     }
+                    Message::VerificationClose => view.sas = None,
                     Message::SetMessage(m) => view.draft = m,
                     Message::SendMessage => {
                         let selected = match view.selected.clone() {

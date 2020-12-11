@@ -103,7 +103,7 @@ pub async fn login(
         homeserver: server.to_owned(),
     };
     write_session(&session)?;
-    client.sync_once(SyncSettings::new()).await?;
+    //client.sync_once(SyncSettings::new()).await?;
 
     Ok((client, session))
 }
@@ -113,7 +113,7 @@ pub async fn restore_login(session: Session) -> Result<(Client, Session), Error>
     let client = client(url)?;
 
     client.restore_login(session.clone().into()).await?;
-    client.sync_once(SyncSettings::new()).await?;
+    //client.sync_once(SyncSettings::new()).await?;
 
     Ok((client, session))
 }
@@ -206,7 +206,7 @@ where
             client
                 .sync_with_callback(
                     SyncSettings::new()
-                        .token(client.sync_token().await.unwrap())
+                        //.token(client.sync_token().await.unwrap())
                         .timeout(Duration::from_secs(90))
                         .full_state(true),
                     |response| async {
