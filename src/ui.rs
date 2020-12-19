@@ -1,13 +1,12 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet},
     time::SystemTime,
 };
 
 use futures::executor::block_on;
 use iced::{
-    text_input::{self, TextInput},
-    Application, Button, Column, Command, Container, Element, Length, Radio, Row, Rule, Scrollable,
-    Subscription, Text,
+    Application, Button, Column, Command, Container, Element, Length, Row, Rule, Scrollable,
+    Subscription, Text, TextInput,
 };
 use matrix_sdk::{
     events::{
@@ -15,151 +14,18 @@ use matrix_sdk::{
         room::message::MessageEventContent, AnyMessageEvent, AnyMessageEventContent,
         AnyPossiblyRedactedSyncMessageEvent, AnyRoomEvent, AnyStateEvent, AnyToDeviceEvent,
     },
-    identifiers::{RoomAliasId, RoomId, UserId},
+    identifiers::{EventId, RoomAliasId, RoomId, UserId},
 };
 
-use crate::matrix;
+use crate::matrix::{self, AnyRoomEventExt};
 
-pub trait AnyRoomEventExt {
-    fn origin_server_ts(&self) -> SystemTime;
-}
+pub mod prompt;
+pub mod settings;
 
-impl AnyRoomEventExt for AnyRoomEvent {
-    fn origin_server_ts(&self) -> SystemTime {
-        match self {
-            AnyRoomEvent::Message(e) => e.origin_server_ts(),
-            AnyRoomEvent::State(e) => e.origin_server_ts(),
-            AnyRoomEvent::RedactedMessage(e) => e.origin_server_ts(),
-            AnyRoomEvent::RedactedState(e) => e.origin_server_ts(),
-        }
-        .to_owned()
-    }
-}
+use prompt::{PromptAction, PromptView};
+use settings::SettingsView;
 
-/// View for the login prompt
-#[derive(Debug, Clone, Default)]
-pub struct PromptView {
-    /// Username input field
-    user_input: text_input::State,
-    /// Password input field
-    password_input: text_input::State,
-    /// Homeserver input field
-    server_input: text_input::State,
-    /// Device name input field
-    device_input: text_input::State,
-    /// Button to trigger login
-    login_button: iced::button::State,
-
-    /// Username
-    user: String,
-    /// Password
-    password: String,
-    /// Homeserver
-    server: String,
-    /// Device name to create login session under
-    device_name: String,
-    /// Whether to log in or sign up
-    action: PromptAction,
-    /// Error message
-    error: Option<String>,
-}
-
-impl PromptView {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn view(&mut self) -> Element<Message> {
-        let mut content = Column::new()
-            .width(500.into())
-            .spacing(5)
-            .push(
-                Row::new()
-                    .spacing(15)
-                    .push(Radio::new(
-                        PromptAction::Login,
-                        "Login",
-                        Some(self.action),
-                        Message::SetAction,
-                    ))
-                    .push(Radio::new(
-                        PromptAction::Signup,
-                        "Sign up",
-                        Some(self.action),
-                        Message::SetAction,
-                    )),
-            )
-            .push(
-                Column::new().push(Text::new("Username")).push(
-                    TextInput::new(
-                        &mut self.user_input,
-                        "Username",
-                        &self.user,
-                        Message::SetUser,
-                    )
-                    .padding(5),
-                ),
-            )
-            .push(
-                Column::new().push(Text::new("Password")).push(
-                    TextInput::new(
-                        &mut self.password_input,
-                        "Password",
-                        &self.password,
-                        Message::SetPassword,
-                    )
-                    .password()
-                    .padding(5),
-                ),
-            )
-            .push(
-                Column::new().push(Text::new("Homeserver")).push(
-                    TextInput::new(
-                        &mut self.server_input,
-                        "https://homeserver.com",
-                        &self.server,
-                        Message::SetServer,
-                    )
-                    .padding(5),
-                ),
-            )
-            .push(
-                Column::new().push(Text::new("Device name")).push(
-                    TextInput::new(
-                        &mut self.device_input,
-                        "retrix on my laptop",
-                        &self.device_name,
-                        Message::SetDeviceName,
-                    )
-                    .padding(5),
-                ),
-            );
-        let button = match self.action {
-            PromptAction::Login => {
-                Button::new(&mut self.login_button, Text::new("Login")).on_press(Message::Login)
-            }
-            PromptAction::Signup => {
-                content = content.push(
-                    Text::new("NB: Signup is very naively implemented, and prone to breaking")
-                        .color([1.0, 0.5, 0.0]),
-                );
-                Button::new(&mut self.login_button, Text::new("Sign up")).on_press(Message::Signup)
-            }
-        };
-        content = content.push(button);
-        if let Some(ref error) = self.error {
-            content = content.push(Text::new(error).color([1.0, 0.0, 0.0]));
-        }
-
-        Container::new(content)
-            .center_x()
-            .center_y()
-            .width(iced::Length::Fill)
-            .height(iced::Length::Fill)
-            .into()
-    }
-}
-
+/// What order to sort rooms in in the room list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomSorting {
     Recent,
@@ -198,54 +64,67 @@ impl RoomEntry {
     }
 }
 
+// Alternate storage strategies: HashMap<EventId, Event>+Vec<EventId>,
+// HashSet<EventId>+BTreemap<Event + Ord(origin_server_ts)>
+/// Message history/event cache for a given room.
 #[derive(Clone, Debug)]
 pub struct MessageBuffer {
-    messages: VecDeque<AnyRoomEvent>,
+    /// The messages we have stored
+    messages: Vec<AnyRoomEvent>,
+    /// Set of event id's we have
+    known_ids: HashSet<EventId>,
     /// Token for the start of the messages we have
-    start: String,
+    start: Option<String>,
     /// Token for the end of the messages we have
-    end: String,
+    end: Option<String>,
     /// Most recent activity in the room
     updated: std::time::SystemTime,
-}
-
-impl Default for MessageBuffer {
-    fn default() -> Self {
-        Self {
-            messages: Default::default(),
-            start: String::new(),
-            end: String::new(),
-            updated: SystemTime::UNIX_EPOCH,
-        }
-    }
 }
 
 impl MessageBuffer {
     /// Sorts the messages by send time
     fn sort(&mut self) {
         self.messages
-            .make_contiguous()
             .sort_unstable_by(|a, b| a.origin_server_ts().cmp(&b.origin_server_ts()))
     }
 
     /// Gets the send time of the most recently sent message
     fn update_time(&mut self) {
-        self.updated = match self.messages.back() {
+        self.updated = match self.messages.last() {
             Some(message) => message.origin_server_ts(),
             None => SystemTime::UNIX_EPOCH,
         };
     }
-    /// Insert a message that's probably the most recent
-    pub fn push_back(&mut self, event: AnyRoomEvent) {
-        self.messages.push_back(event);
+
+    /// Add a message to the buffer.
+    pub fn push(&mut self, event: AnyRoomEvent) {
+        self.known_ids.insert(event.event_id().clone());
+        self.messages.push(event);
         self.sort();
         self.update_time();
     }
 
-    pub fn push_front(&mut self, event: AnyRoomEvent) {
-        self.messages.push_front(event);
+    /// Adds several messages to the buffer
+    pub fn append(&mut self, mut events: Vec<AnyRoomEvent>) {
+        events.retain(|e| !self.known_ids.contains(e.event_id()));
+        for event in events.iter() {
+            self.known_ids.insert(event.event_id().clone());
+        }
+        self.messages.append(&mut events);
         self.sort();
         self.update_time();
+    }
+}
+
+impl Default for MessageBuffer {
+    fn default() -> Self {
+        Self {
+            messages: Default::default(),
+            known_ids: Default::default(),
+            start: None,
+            end: None,
+            updated: SystemTime::UNIX_EPOCH,
+        }
     }
 }
 
@@ -256,6 +135,8 @@ pub struct MainView {
     settings_view: Option<SettingsView>,
     /// The matrix-sdk client
     client: matrix_sdk::Client,
+    /// Sync token to use for backfill calls
+    sync_token: String,
     session: matrix::Session,
     /// Draft of message to send
     draft: String,
@@ -267,11 +148,12 @@ pub struct MainView {
     sas: Option<matrix_sdk::Sas>,
     /// Whether to sort rooms alphabetically or by activity
     sorting: RoomSorting,
+    /// Room state
     rooms: BTreeMap<RoomId, RoomEntry>,
 
-    /// Room list entry/button to select room
+    /// Room list entries for direct conversations
     dm_buttons: Vec<iced::button::State>,
-    ///
+    /// Room list entries for group conversations
     group_buttons: Vec<iced::button::State>,
     /// Room list scrollbar state
     room_scroll: iced::scrollable::State,
@@ -294,6 +176,7 @@ impl MainView {
         Self {
             client,
             session,
+            sync_token: String::new(),
             settings_view: None,
             settings_button: Default::default(),
             error: None,
@@ -569,18 +452,6 @@ pub enum Retrix {
     LoggedIn(MainView),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptAction {
-    Login,
-    Signup,
-}
-
-impl Default for PromptAction {
-    fn default() -> Self {
-        PromptAction::Login
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Message {
     // Login form messages
@@ -596,7 +467,11 @@ pub enum Message {
     LoginFailed(String),
 
     // Main state messages
-    ResetRooms(BTreeMap<RoomId, RoomEntry>),
+    /// Reset state for room
+    ResetRoom(RoomId, RoomEntry),
+    /// Get backfill for given room
+    BackFill(RoomId),
+    /// View messages from this room
     SelectRoom(RoomId),
     /// Set error message
     ErrorMessage(String),
@@ -604,6 +479,7 @@ pub enum Message {
     ClearError,
     /// Set how the room list is sorted
     SetSort(RoomSorting),
+    /// Set verification flow
     SetVerification(Option<matrix_sdk::Sas>),
     /// Accept verification flow
     VerificationAccept,
@@ -621,6 +497,8 @@ pub enum Message {
     VerificationClose,
     /// Matrix event received
     Sync(matrix::Event),
+    /// Update the sync token to use
+    SyncToken(String),
     /// Set contents of message compose box
     SetMessage(String),
     /// Send the contents of the compose box to the selected room
@@ -643,124 +521,6 @@ pub enum Message {
     SetKeyPassword(String),
     /// Import encryption keys
     ImportKeys,
-}
-
-#[derive(Clone, Default, Debug)]
-pub struct SettingsView {
-    /// Display name to set
-    display_name: String,
-    /// Are we saving the display name?
-    saving_name: bool,
-
-    /// Display name text input
-    display_name_input: iced::text_input::State,
-    /// Button to set display name
-    display_name_button: iced::button::State,
-
-    /// Path to import encryption keys from
-    key_path: String,
-    /// Password to decrypt the keys with
-    key_password: String,
-
-    /// Encryption key path entry
-    key_path_input: iced::text_input::State,
-    /// Entry for key password
-    key_password_input: iced::text_input::State,
-    /// Button to import keys
-    key_import_button: iced::button::State,
-    /// Button  to close settings view
-    close_button: iced::button::State,
-}
-
-impl SettingsView {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn view(&mut self, sort: RoomSorting) -> Element<Message> {
-        let content = Column::new()
-            .width(500.into())
-            .spacing(5)
-            .push(Text::new("Profile").size(25))
-            .push(
-                Column::new().push(Text::new("Display name")).push(
-                    Row::new()
-                        .push(
-                            TextInput::new(
-                                &mut self.display_name_input,
-                                "Alice",
-                                &self.display_name,
-                                Message::SetDisplayNameInput,
-                            )
-                            .width(Length::Fill)
-                            .padding(5),
-                        )
-                        .push(match self.saving_name {
-                            false => Button::new(&mut self.display_name_button, Text::new("Save"))
-                                .on_press(Message::SaveDisplayName),
-                            true => {
-                                Button::new(&mut self.display_name_button, Text::new("Saving..."))
-                            }
-                        }),
-                ),
-            )
-            .push(Text::new("Appearance").size(25))
-            .push(Text::new("Sort messages by:"))
-            .push(Radio::new(
-                RoomSorting::Alphabetic,
-                "Name",
-                Some(sort),
-                Message::SetSort,
-            ))
-            .push(Radio::new(
-                RoomSorting::Recent,
-                "Activity",
-                Some(sort),
-                Message::SetSort,
-            ))
-            .push(Text::new("Encryption").size(25))
-            .push(
-                Column::new()
-                    .push(Text::new("Import key (enter path)"))
-                    .push(
-                        TextInput::new(
-                            &mut self.key_path_input,
-                            "/home/user/exported_keys.txt",
-                            &self.key_path,
-                            Message::SetKeyPath,
-                        )
-                        .padding(5),
-                    ),
-            )
-            .push(
-                Column::new().push(Text::new("Key password")).push(
-                    TextInput::new(
-                        &mut self.key_password_input,
-                        "SecretPassword42",
-                        &self.key_password,
-                        Message::SetKeyPassword,
-                    )
-                    .password()
-                    .padding(5),
-                ),
-            )
-            .push(
-                Button::new(&mut self.key_import_button, Text::new("Import keys"))
-                    .on_press(Message::ImportKeys),
-            )
-            .push(
-                Row::new().width(Length::Fill).push(
-                    Button::new(&mut self.close_button, Text::new("Close"))
-                        .on_press(Message::CloseSettings),
-                ),
-            );
-        Container::new(content)
-            .center_x()
-            .center_y()
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
 }
 
 impl Application for Retrix {
@@ -854,248 +614,251 @@ impl Application for Retrix {
                 }
                 Message::LoggedIn(client, session) => {
                     *self = Retrix::LoggedIn(MainView::new(client.clone(), session));
-                    return Command::perform(
-                        async move {
-                            let mut rooms: BTreeMap<RoomId, RoomEntry> = BTreeMap::new();
-                            for (id, room) in client.joined_rooms().read().await.iter() {
-                                let room = room.read().await;
-                                let entry = rooms.entry(id.clone()).or_default();
+                    let joined = client.joined_rooms();
+                    let read = block_on(async { joined.read().await });
+                    let mut commands: Vec<Command<Message>> = Vec::new();
+                    for (id, room) in read.iter() {
+                        let id = id.clone();
+                        let room = room.clone();
+                        let client = client.clone();
+                        let command = async move {
+                            let room = room.read().await;
+                            let mut entry = RoomEntry::default();
 
-                                entry.direct = room.direct_target.clone();
-                                // Display name calculation for DMs is bronk so we're doing it
-                                // ourselves
-                                match entry.direct {
-                                    Some(ref direct) => {
-                                        let request = matrix_sdk::api::r0::profile::get_display_name::Request::new(direct);
-                                        if let Ok(response) = client.send(request).await {
-                                            if let Some(name) = response.displayname {
-                                                entry.name = name;
-                                            }
+                            entry.direct = room.direct_target.clone();
+                            // Display name calculation for DMs is bronk so we're doing it
+                            // ourselves
+                            match entry.direct {
+                                Some(ref direct) => {
+                                    let request = matrix_sdk::api::r0::profile::get_display_name::Request::new(direct);
+                                    if let Ok(response) = client.send(request).await {
+                                        if let Some(name) = response.displayname {
+                                            entry.name = name;
                                         }
                                     }
-                                    None => entry.name = room.display_name(),
                                 }
-                                let messages = room
-                                    .messages
-                                    .iter()
-                                    .cloned()
-                                    .map(|event| match event {
-                                        AnyPossiblyRedactedSyncMessageEvent::Redacted(e) => {
-                                            AnyRoomEvent::RedactedMessage(
-                                                e.into_full_event(id.clone()),
-                                            )
-                                        }
-                                        AnyPossiblyRedactedSyncMessageEvent::Regular(e) => {
-                                            AnyRoomEvent::Message(e.into_full_event(id.clone()))
-                                        }
-                                    })
-                                    .collect();
-                                entry.messages.messages = messages;
+                                None => entry.name = room.display_name(),
                             }
-                            rooms
-                        },
-                        Message::ResetRooms,
-                    );
+                            let messages = room
+                                .messages
+                                .iter()
+                                .cloned()
+                                .map(|event| match event {
+                                    AnyPossiblyRedactedSyncMessageEvent::Redacted(e) => {
+                                        AnyRoomEvent::RedactedMessage(
+                                            e.into_full_event(id.clone()),
+                                        )
+                                    }
+                                    AnyPossiblyRedactedSyncMessageEvent::Regular(e) => {
+                                        AnyRoomEvent::Message(e.into_full_event(id.clone()))
+                                    }
+                                })
+                            .collect();
+                            entry.messages.messages = messages;
+                            Message::ResetRoom(id, entry)
+                        }.into();
+                        commands.push(command)
+                    }
+                    return Command::batch(commands);
                 }
                 _ => (),
             },
-            Retrix::LoggedIn(view) => {
-                match message {
-                    Message::ErrorMessage(e) => view.error = Some((e, Default::default())),
-                    Message::ClearError => view.error = None,
-                    Message::SetSort(s) => view.sorting = s,
-                    Message::ResetRooms(r) => view.rooms = r,
-                    Message::SelectRoom(r) => view.selected = Some(r),
-                    Message::Sync(event) => match event {
-                        matrix::Event::Room(event) => match event {
-                            AnyRoomEvent::Message(event) => {
-                                let room = view.rooms.entry(event.room_id().clone()).or_default();
-                                room.messages.push_back(AnyRoomEvent::Message(event));
-                            }
-                            AnyRoomEvent::State(event) => match event {
-                                AnyStateEvent::RoomCanonicalAlias(ref alias) => {
-                                    let room = view.rooms.entry(alias.room_id.clone()).or_default();
-                                    room.alias = alias.content.alias.clone();
-                                    room.messages.push_back(AnyRoomEvent::State(event));
-                                }
-                                AnyStateEvent::RoomName(ref name) => {
-                                    let room = view.rooms.entry(name.room_id.clone()).or_default();
-                                    room.display_name = name.content.name().map(String::from);
-                                    room.messages.push_back(AnyRoomEvent::State(event));
-                                }
-                                AnyStateEvent::RoomTopic(ref topic) => {
-                                    let room = view.rooms.entry(topic.room_id.clone()).or_default();
-                                    room.topic = topic.content.topic.clone();
-                                    room.messages.push_back(AnyRoomEvent::State(event));
-                                }
-                                ref any => {
-                                    // Ensure room exists
-                                    let room = view.rooms.entry(any.room_id().clone()).or_default();
-                                    room.messages.push_back(AnyRoomEvent::State(event));
-                                }
-                            },
-                            _ => (),
-                        },
-                        matrix::Event::ToDevice(event) => match event {
-                            AnyToDeviceEvent::KeyVerificationStart(start) => {
-                                let client = view.client.clone();
-                                return Command::perform(
-                                    async move {
-                                        tokio::time::delay_for(std::time::Duration::from_secs(2))
-                                            .await;
-                                        client.get_verification(&start.content.transaction_id).await
-                                    },
-                                    Message::SetVerification,
-                                );
-                            }
-                            AnyToDeviceEvent::KeyVerificationCancel(cancel) => {
-                                return async {
-                                    Message::VerificationCancelled(cancel.content.code)
-                                }
-                                .into();
-                            }
-                            _ => (),
-                        },
-                    },
-                    Message::SetVerification(v) => view.sas = v,
-                    Message::VerificationAccept => {
-                        let sas = match &view.sas {
-                            Some(sas) => sas.clone(),
-                            None => return Command::none(),
-                        };
-                        return Command::perform(async move { sas.accept().await }, |result| {
-                            match result {
-                                Ok(()) => Message::VerificationAccepted,
-                                Err(e) => Message::ErrorMessage(e.to_string()),
-                            }
-                        });
-                    }
-                    Message::VerificationConfirm => {
-                        let sas = match &view.sas {
-                            Some(sas) => sas.clone(),
-                            None => return Command::none(),
-                        };
-                        return Command::perform(async move { sas.confirm().await }, |result| {
-                            match result {
-                                Ok(()) => Message::VerificationConfirmed,
-                                Err(e) => Message::ErrorMessage(e.to_string()),
-                            }
-                        });
-                    }
-                    Message::VerificationCancel => {
-                        let sas = match &view.sas {
-                            Some(sas) => sas.clone(),
-                            None => return Command::none(),
-                        };
-                        return Command::perform(async move { sas.cancel().await }, |result| {
-                            match result {
-                                Ok(()) => {
-                                    Message::VerificationCancelled(VerificationCancelCode::User)
-                                }
-                                Err(e) => Message::ErrorMessage(e.to_string()),
-                            }
-                        });
-                    }
-                    Message::VerificationCancelled(code) => {
-                        view.sas = None;
-                        return async move { Message::ErrorMessage(code.as_str().to_owned()) }
-                            .into();
-                    }
-                    Message::VerificationClose => view.sas = None,
-                    Message::SetMessage(m) => view.draft = m,
-                    Message::SendMessage => {
-                        let selected = match view.selected.clone() {
-                            Some(selected) => selected,
-                            None => return Command::none(),
-                        };
-                        let draft = view.draft.clone();
-                        let client = view.client.clone();
-                        return Command::perform(
-                            async move {
-                                client
-                                    .room_send(
-                                        &selected,
-                                        AnyMessageEventContent::RoomMessage(
-                                            MessageEventContent::text_plain(draft),
-                                        ),
-                                        None,
-                                    )
-                                    .await
-                            },
-                            |result| match result {
-                                Ok(_) => Message::SetMessage(String::new()),
-                                Err(e) => Message::ErrorMessage(e.to_string()),
-                            },
-                        );
-                    }
-                    Message::OpenSettings => {
-                        view.settings_view = Some(SettingsView::new());
-                        let client = view.client.clone();
-                        return Command::perform(
-                            async move {
-                                client
-                                    .display_name()
-                                    .await
-                                    .unwrap_or_default()
-                                    .unwrap_or_default()
-                            },
-                            Message::SetDisplayNameInput,
-                        );
-                    }
-                    Message::SetDisplayNameInput(name) => {
-                        if let Some(ref mut settings) = view.settings_view {
-                            settings.display_name = name;
-                        }
-                    }
-                    Message::SaveDisplayName => {
-                        if let Some(ref mut settings) = view.settings_view {
-                            let client = view.client.clone();
-                            let name = settings.display_name.clone();
-                            settings.saving_name = true;
-                            return Command::perform(
-                                async move { client.set_display_name(Some(&name)).await },
-                                |result| match result {
-                                    Ok(()) => Message::DisplayNameSaved,
-                                    // TODO: set saving to false and report error
-                                    Err(_) => Message::DisplayNameSaved,
-                                },
-                            );
-                        }
-                    }
-                    Message::DisplayNameSaved => {
-                        if let Some(ref mut settings) = view.settings_view {
-                            settings.saving_name = false;
-                        }
-                    }
-                    Message::SetKeyPath(p) => {
-                        if let Some(ref mut settings) = view.settings_view {
-                            settings.key_path = p;
-                        }
-                    }
-                    Message::SetKeyPassword(p) => {
-                        if let Some(ref mut settings) = view.settings_view {
-                            settings.key_password = p;
-                        }
-                    }
-                    Message::ImportKeys => {
-                        if let Some(ref settings) = view.settings_view {
-                            let path = std::path::PathBuf::from(&settings.key_path);
-                            let password = settings.key_password.clone();
-                            let client = view.client.clone();
-                            return Command::perform(
-                                async move { client.import_keys(path, &password).await },
-                                |result| match result {
-                                    Ok(_) => Message::SetKeyPassword(String::new()),
-                                    // TODO: Actual error reporting here
-                                    Err(e) => Message::SetKeyPath(e.to_string()),
-                                },
-                            );
-                        }
-                    }
-                    Message::CloseSettings => view.settings_view = None,
-                    _ => (),
+            Retrix::LoggedIn(view) => match message {
+                Message::ErrorMessage(e) => view.error = Some((e, Default::default())),
+                Message::ClearError => view.error = None,
+                Message::SetSort(s) => view.sorting = s,
+                Message::ResetRoom(id, room) => {
+                    view.rooms.insert(id, room).and(Some(())).unwrap_or(())
                 }
-            }
+                Message::SelectRoom(r) => view.selected = Some(r),
+                Message::Sync(event) => match event {
+                    matrix::Event::Room(event) => match event {
+                        AnyRoomEvent::Message(event) => {
+                            let room = view.rooms.entry(event.room_id().clone()).or_default();
+                            room.messages.push(AnyRoomEvent::Message(event));
+                        }
+                        AnyRoomEvent::State(event) => match event {
+                            AnyStateEvent::RoomCanonicalAlias(ref alias) => {
+                                let room = view.rooms.entry(alias.room_id.clone()).or_default();
+                                room.alias = alias.content.alias.clone();
+                                room.messages.push(AnyRoomEvent::State(event));
+                            }
+                            AnyStateEvent::RoomName(ref name) => {
+                                let room = view.rooms.entry(name.room_id.clone()).or_default();
+                                room.display_name = name.content.name().map(String::from);
+                                room.messages.push(AnyRoomEvent::State(event));
+                            }
+                            AnyStateEvent::RoomTopic(ref topic) => {
+                                let room = view.rooms.entry(topic.room_id.clone()).or_default();
+                                room.topic = topic.content.topic.clone();
+                                room.messages.push(AnyRoomEvent::State(event));
+                            }
+                            ref any => {
+                                // Ensure room exists
+                                let room = view.rooms.entry(any.room_id().clone()).or_default();
+                                room.messages.push(AnyRoomEvent::State(event));
+                            }
+                        },
+                        _ => (),
+                    },
+                    matrix::Event::ToDevice(event) => match event {
+                        AnyToDeviceEvent::KeyVerificationStart(start) => {
+                            let client = view.client.clone();
+                            return Command::perform(
+                                async move {
+                                    tokio::time::delay_for(std::time::Duration::from_secs(2)).await;
+                                    client.get_verification(&start.content.transaction_id).await
+                                },
+                                Message::SetVerification,
+                            );
+                        }
+                        AnyToDeviceEvent::KeyVerificationCancel(cancel) => {
+                            return async { Message::VerificationCancelled(cancel.content.code) }
+                                .into();
+                        }
+                        _ => (),
+                    },
+                    matrix::Event::Token(token) => {
+                        view.sync_token = token;
+                    }
+                },
+                Message::SetVerification(v) => view.sas = v,
+                Message::VerificationAccept => {
+                    let sas = match &view.sas {
+                        Some(sas) => sas.clone(),
+                        None => return Command::none(),
+                    };
+                    return Command::perform(
+                        async move { sas.accept().await },
+                        |result| match result {
+                            Ok(()) => Message::VerificationAccepted,
+                            Err(e) => Message::ErrorMessage(e.to_string()),
+                        },
+                    );
+                }
+                Message::VerificationConfirm => {
+                    let sas = match &view.sas {
+                        Some(sas) => sas.clone(),
+                        None => return Command::none(),
+                    };
+                    return Command::perform(async move { sas.confirm().await }, |result| {
+                        match result {
+                            Ok(()) => Message::VerificationConfirmed,
+                            Err(e) => Message::ErrorMessage(e.to_string()),
+                        }
+                    });
+                }
+                Message::VerificationCancel => {
+                    let sas = match &view.sas {
+                        Some(sas) => sas.clone(),
+                        None => return Command::none(),
+                    };
+                    return Command::perform(
+                        async move { sas.cancel().await },
+                        |result| match result {
+                            Ok(()) => Message::VerificationCancelled(VerificationCancelCode::User),
+                            Err(e) => Message::ErrorMessage(e.to_string()),
+                        },
+                    );
+                }
+                Message::VerificationCancelled(code) => {
+                    view.sas = None;
+                    return async move { Message::ErrorMessage(code.as_str().to_owned()) }.into();
+                }
+                Message::VerificationClose => view.sas = None,
+                Message::SetMessage(m) => view.draft = m,
+                Message::SendMessage => {
+                    let selected = match view.selected.clone() {
+                        Some(selected) => selected,
+                        None => return Command::none(),
+                    };
+                    let draft = view.draft.clone();
+                    let client = view.client.clone();
+                    return Command::perform(
+                        async move {
+                            client
+                                .room_send(
+                                    &selected,
+                                    AnyMessageEventContent::RoomMessage(
+                                        MessageEventContent::text_plain(draft),
+                                    ),
+                                    None,
+                                )
+                                .await
+                        },
+                        |result| match result {
+                            Ok(_) => Message::SetMessage(String::new()),
+                            Err(e) => Message::ErrorMessage(e.to_string()),
+                        },
+                    );
+                }
+                Message::OpenSettings => {
+                    view.settings_view = Some(SettingsView::new());
+                    let client = view.client.clone();
+                    return Command::perform(
+                        async move {
+                            client
+                                .display_name()
+                                .await
+                                .unwrap_or_default()
+                                .unwrap_or_default()
+                        },
+                        Message::SetDisplayNameInput,
+                    );
+                }
+                Message::SetDisplayNameInput(name) => {
+                    if let Some(ref mut settings) = view.settings_view {
+                        settings.display_name = name;
+                    }
+                }
+                Message::SaveDisplayName => {
+                    if let Some(ref mut settings) = view.settings_view {
+                        let client = view.client.clone();
+                        let name = settings.display_name.clone();
+                        settings.saving_name = true;
+                        return Command::perform(
+                            async move { client.set_display_name(Some(&name)).await },
+                            |result| match result {
+                                Ok(()) => Message::DisplayNameSaved,
+                                // TODO: set saving to false and report error
+                                Err(_) => Message::DisplayNameSaved,
+                            },
+                        );
+                    }
+                }
+                Message::DisplayNameSaved => {
+                    if let Some(ref mut settings) = view.settings_view {
+                        settings.saving_name = false;
+                    }
+                }
+                Message::SetKeyPath(p) => {
+                    if let Some(ref mut settings) = view.settings_view {
+                        settings.key_path = p;
+                    }
+                }
+                Message::SetKeyPassword(p) => {
+                    if let Some(ref mut settings) = view.settings_view {
+                        settings.key_password = p;
+                    }
+                }
+                Message::ImportKeys => {
+                    if let Some(ref settings) = view.settings_view {
+                        let path = std::path::PathBuf::from(&settings.key_path);
+                        let password = settings.key_password.clone();
+                        let client = view.client.clone();
+                        return Command::perform(
+                            async move { client.import_keys(path, &password).await },
+                            |result| match result {
+                                Ok(_) => Message::SetKeyPassword(String::new()),
+                                // TODO: Actual error reporting here
+                                Err(e) => Message::SetKeyPath(e.to_string()),
+                            },
+                        );
+                    }
+                }
+                Message::CloseSettings => view.settings_view = None,
+                _ => (),
+            },
         };
         Command::none()
     }

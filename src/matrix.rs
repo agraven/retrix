@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use matrix_sdk::{
     api::r0::{account::register::Request as RegistrationRequest, uiaa::AuthData},
     events::{AnyRoomEvent, AnySyncRoomEvent, AnyToDeviceEvent},
-    identifiers::{DeviceId, UserId},
+    identifiers::{DeviceId, EventId, UserId},
     reqwest::Url,
     Client, ClientConfig, LoopCtrl, SyncSettings,
 };
@@ -181,6 +181,7 @@ impl EventEmitter for Callback {
 pub enum Event {
     Room(AnyRoomEvent),
     ToDevice(AnyToDeviceEvent),
+    Token(String),
 }
 
 impl<H, I> iced_futures::subscription::Recipe<H, I> for MatrixSync
@@ -210,6 +211,7 @@ where
                         .timeout(Duration::from_secs(90))
                         .full_state(true),
                     |response| async {
+                        sender.send(Event::Token(response.next_batch)).ok();
                         for (id, room) in response.rooms.join {
                             for event in room.timeline.events {
                                 let event = match event.deserialize() {
@@ -241,14 +243,38 @@ where
                             };
                             sender.send(Event::ToDevice(event)).ok();
                         }
-
                         LoopCtrl::Continue
                     },
                 )
                 .await;
-            println!("We stopped syncing!");
         });
         self.join = Some(join);
         Box::pin(receiver)
+    }
+}
+
+pub trait AnyRoomEventExt {
+    fn event_id(&self) -> &EventId;
+    /// Gets the ´origin_server_ts` member of the underlying event
+    fn origin_server_ts(&self) -> SystemTime;
+}
+
+impl AnyRoomEventExt for AnyRoomEvent {
+    fn event_id(&self) -> &EventId {
+        match self {
+            AnyRoomEvent::Message(e) => e.event_id(),
+            AnyRoomEvent::State(e) => e.event_id(),
+            AnyRoomEvent::RedactedMessage(e) => e.event_id(),
+            AnyRoomEvent::RedactedState(e) => e.event_id(),
+        }
+    }
+    fn origin_server_ts(&self) -> SystemTime {
+        match self {
+            AnyRoomEvent::Message(e) => e.origin_server_ts(),
+            AnyRoomEvent::State(e) => e.origin_server_ts(),
+            AnyRoomEvent::RedactedMessage(e) => e.origin_server_ts(),
+            AnyRoomEvent::RedactedState(e) => e.origin_server_ts(),
+        }
+        .to_owned()
     }
 }
