@@ -9,10 +9,13 @@ use iced::{
     Subscription, Text, TextInput,
 };
 use matrix_sdk::{
+    api::r0::message::get_message_events::{
+        Request as MessageRequest, Response as MessageResponse,
+    },
     events::{
         key::verification::cancel::CancelCode as VerificationCancelCode,
-        room::message::MessageEventContent, AnyMessageEvent, AnyMessageEventContent,
-        AnyPossiblyRedactedSyncMessageEvent, AnyRoomEvent, AnyStateEvent, AnyToDeviceEvent,
+        room::message::MessageEventContent, AnyMessageEvent, AnyMessageEventContent, AnyRoomEvent,
+        AnyStateEvent, AnyToDeviceEvent,
     },
     identifiers::{EventId, RoomAliasId, RoomId, UserId},
 };
@@ -85,7 +88,7 @@ impl MessageBuffer {
     /// Sorts the messages by send time
     fn sort(&mut self) {
         self.messages
-            .sort_unstable_by(|a, b| a.origin_server_ts().cmp(&b.origin_server_ts()))
+            .sort_unstable_by_key(|msg| msg.origin_server_ts())
     }
 
     /// Gets the send time of the most recently sent message
@@ -209,6 +212,7 @@ impl MainView {
             .scrollbar_width(5);
 
         // Group by DM and group conversation
+        #[allow(clippy::type_complexity)]
         let (mut dm_rooms, mut group_rooms): (
             Vec<(&RoomId, &RoomEntry)>,
             Vec<(&RoomId, &RoomEntry)>,
@@ -219,14 +223,16 @@ impl MainView {
         // Sort
         for list in [&mut dm_rooms, &mut group_rooms].iter_mut() {
             match self.sorting {
-                RoomSorting::Alphabetic => list.sort_unstable_by(|(_, a), (_, b)| {
-                    a.name.to_uppercase().cmp(&b.name.to_uppercase())
-                }),
+                RoomSorting::Alphabetic => {
+                    list.sort_unstable_by_key(|(_, room)| room.name.to_uppercase())
+                }
+                // TODO: fix this
                 RoomSorting::Recent => list.sort_unstable_by(|(_, a), (_, b)| {
                     a.messages.updated.cmp(&b.messages.updated).reverse()
                 }),
             };
         }
+        // Make sure button handler list has appropriate length
         self.dm_buttons
             .resize_with(dm_rooms.len(), Default::default);
         self.group_buttons
@@ -241,7 +247,7 @@ impl MainView {
                 let (id, room) = dm_rooms[idx];
                 Button::new(button, Text::new(&room.name))
                     .width(300.into())
-                    .on_press(Message::SelectRoom(id.clone().clone()))
+                    .on_press(Message::SelectRoom(id.to_owned()))
             })
             .collect();
         let room_buttons: Vec<Button<_>> = self
@@ -252,7 +258,7 @@ impl MainView {
                 let (id, room) = group_rooms[idx];
                 Button::new(button, Text::new(&room.name))
                     .width(300.into())
-                    .on_press(Message::SelectRoom(id.clone()))
+                    .on_press(Message::SelectRoom(id.to_owned()))
             })
             .collect();
         // Add buttons to container
@@ -279,23 +285,30 @@ impl MainView {
             None => None,
         };
         if let Some(room) = selected_room {
+            let title = if let Some(ref direct) = room.direct {
+                format!("{} ({})", &room.name, direct)
+            } else if let Some(ref alias) = room.alias {
+                format!("{} ({})", &room.name, alias)
+            } else {
+                room.name.clone()
+            };
             message_col = message_col
-                .push(Text::new(&room.name).size(25))
+                .push(Text::new(title).size(25))
                 .push(Rule::horizontal(2));
             let mut scroll = Scrollable::new(&mut self.message_scroll)
                 .scrollbar_width(2)
                 .height(Length::Fill);
             for event in room.messages.messages.iter() {
+                #[allow(clippy::single_match)]
                 match event {
                     AnyRoomEvent::Message(AnyMessageEvent::RoomMessage(message)) => {
                         let sender = {
-                            let joined = self.client.joined_rooms();
-                            let rooms_lock = block_on(async { joined.read().await });
-                            match rooms_lock.get(&message.room_id) {
+                            match self.client.get_joined_room(&message.room_id) {
                                 Some(backend) => {
-                                    let room_lock = block_on(async { backend.read().await });
-                                    match room_lock.joined_members.get(&message.sender) {
-                                        Some(member) => member.disambiguated_name(),
+                                    match block_on(async {
+                                        backend.get_member(&message.sender).await
+                                    }) {
+                                        Some(member) => member.name().to_owned(),
                                         None => message.sender.to_string(),
                                     }
                                 }
@@ -347,6 +360,9 @@ impl MainView {
                             .push(content)
                             .push(Text::new(format_systime(message.origin_server_ts)));
                         scroll = scroll.push(row);
+                    }
+                    AnyRoomEvent::Message(AnyMessageEvent::RoomEncrypted(_encrypted)) => {
+                        scroll = scroll.push(Text::new("Encrypted event").color([0.3, 0.3, 0.3]))
                     }
                     _ => (),
                 }
@@ -445,6 +461,7 @@ impl MainView {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Retrix {
     Prompt(PromptView),
@@ -471,6 +488,8 @@ pub enum Message {
     ResetRoom(RoomId, RoomEntry),
     /// Get backfill for given room
     BackFill(RoomId),
+    /// Received backfille
+    BackFilled(RoomId, MessageResponse),
     /// View messages from this room
     SelectRoom(RoomId),
     /// Set error message
@@ -608,27 +627,28 @@ impl Application for Retrix {
             },
             Retrix::AwaitLogin => match message {
                 Message::LoginFailed(e) => {
-                    let mut view = PromptView::default();
-                    view.error = Some(e);
+                    let view = PromptView {
+                        error: Some(e),
+                        ..PromptView::default()
+                    };
                     *self = Retrix::Prompt(view);
                 }
                 Message::LoggedIn(client, session) => {
                     *self = Retrix::LoggedIn(MainView::new(client.clone(), session));
-                    let joined = client.joined_rooms();
-                    let read = block_on(async { joined.read().await });
                     let mut commands: Vec<Command<Message>> = Vec::new();
-                    for (id, room) in read.iter() {
-                        let id = id.clone();
-                        let room = room.clone();
-                        let client = client.clone();
+                    for room in client.joined_rooms().into_iter() {
                         let command = async move {
-                            let room = room.read().await;
-                            let mut entry = RoomEntry::default();
+                            let room = room.clone();
+                            let entry = RoomEntry {
+                                direct: room.direct_target(),
+                                name: block_on(async { room.calculate_name().await }),
+                                topic: room.topic().unwrap_or_default(),
+                                ..RoomEntry::default()
+                            };
 
-                            entry.direct = room.direct_target.clone();
                             // Display name calculation for DMs is bronk so we're doing it
                             // ourselves
-                            match entry.direct {
+                            /*match entry.direct {
                                 Some(ref direct) => {
                                     let request = matrix_sdk::api::r0::profile::get_display_name::Request::new(direct);
                                     if let Ok(response) = client.send(request).await {
@@ -638,8 +658,8 @@ impl Application for Retrix {
                                     }
                                 }
                                 None => entry.name = room.display_name(),
-                            }
-                            let messages = room
+                            }*/
+                            /*let messages = room
                                 .messages
                                 .iter()
                                 .cloned()
@@ -654,9 +674,10 @@ impl Application for Retrix {
                                     }
                                 })
                             .collect();
-                            entry.messages.messages = messages;
-                            Message::ResetRoom(id, entry)
-                        }.into();
+                            entry.messages.messages = messages;*/
+                            Message::ResetRoom(room.room_id().to_owned(), entry)
+                        }
+                        .into();
                         commands.push(command)
                     }
                     return Command::batch(commands);
@@ -670,12 +691,36 @@ impl Application for Retrix {
                 Message::ResetRoom(id, room) => {
                     view.rooms.insert(id, room).and(Some(())).unwrap_or(())
                 }
-                Message::SelectRoom(r) => view.selected = Some(r),
+                Message::SelectRoom(r) => {
+                    view.selected = Some(r.clone());
+                    return async move { Message::BackFill(r) }.into();
+                }
                 Message::Sync(event) => match event {
                     matrix::Event::Room(event) => match event {
                         AnyRoomEvent::Message(event) => {
                             let room = view.rooms.entry(event.room_id().clone()).or_default();
-                            room.messages.push(AnyRoomEvent::Message(event));
+                            room.messages.push(AnyRoomEvent::Message(event.clone()));
+                            // Set read marker if message is in selected room
+                            if view.selected.as_ref() == Some(event.room_id()) {
+                                let client = view.client.clone();
+                                return Command::perform(
+                                    async move {
+                                        client
+                                            .read_marker(
+                                                event.room_id(),
+                                                event.event_id(),
+                                                Some(event.event_id()),
+                                            )
+                                            .await
+                                            .err()
+                                    },
+                                    |result| match result {
+                                        Some(err) => Message::ErrorMessage(err.to_string()),
+                                        // TODO: Make this an actual no-op
+                                        None => Message::Login,
+                                    },
+                                );
+                            }
                         }
                         AnyRoomEvent::State(event) => match event {
                             AnyStateEvent::RoomCanonicalAlias(ref alias) => {
@@ -706,7 +751,7 @@ impl Application for Retrix {
                             let client = view.client.clone();
                             return Command::perform(
                                 async move {
-                                    tokio::time::delay_for(std::time::Duration::from_secs(2)).await;
+                                    //tokio::time::delay_for(std::time::Duration::from_secs(2)).await;
                                     client.get_verification(&start.content.transaction_id).await
                                 },
                                 Message::SetVerification,
@@ -722,6 +767,48 @@ impl Application for Retrix {
                         view.sync_token = token;
                     }
                 },
+                Message::BackFill(id) => {
+                    let room = view.rooms.get(&id).unwrap();
+                    let client = view.client.clone();
+                    let token = match room.messages.end.clone() {
+                        Some(end) => end,
+                        None => client
+                            .get_joined_room(&id)
+                            .unwrap()
+                            .last_prev_batch()
+                            .unwrap_or_else(|| view.sync_token.clone()),
+                    };
+                    return async move {
+                        let request = MessageRequest::backward(&id, &token);
+                        match client.room_messages(request).await {
+                            Ok(response) => Message::BackFilled(id, response),
+                            Err(e) => Message::ErrorMessage(e.to_string()),
+                        }
+                    }
+                    .into();
+                }
+                Message::BackFilled(id, response) => {
+                    let room = view.rooms.get_mut(&id).unwrap();
+                    let events: Vec<AnyRoomEvent> = response
+                        .chunk
+                        .into_iter()
+                        .filter_map(|e| e.deserialize().ok())
+                        .chain(
+                            response
+                                .state
+                                .into_iter()
+                                .filter_map(|e| e.deserialize().ok().map(AnyRoomEvent::State)),
+                        )
+                        .collect();
+
+                    if let Some(start) = response.start {
+                        room.messages.start = Some(start);
+                    }
+                    if let Some(end) = response.end {
+                        room.messages.end = Some(end);
+                    }
+                    room.messages.append(events);
+                }
                 Message::SetVerification(v) => view.sas = v,
                 Message::VerificationAccept => {
                     let sas = match &view.sas {

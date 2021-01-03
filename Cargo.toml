@@ -23,7 +23,7 @@ tracing-subscriber = { version = "0.2", features = ["parking_lot"] }
 
 [dependencies.matrix-sdk]
 git = "https://github.com/matrix-org/matrix-rust-sdk"
-rev = "d9e5a17"
+rev = "74998c8"
 default_features = false
 features = ["encryption", "sqlite_cryptostore", "messages", "rustls-tls", "unstable-synapse-quirks"]
 

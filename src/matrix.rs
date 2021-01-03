@@ -214,10 +214,6 @@ where
                         sender.send(Event::Token(response.next_batch)).ok();
                         for (id, room) in response.rooms.join {
                             for event in room.timeline.events {
-                                let event = match event.deserialize() {
-                                    Ok(event) => event,
-                                    Err(_) => continue,
-                                };
                                 let id = id.clone();
                                 let event = match event {
                                     AnySyncRoomEvent::Message(e) => {
@@ -237,10 +233,6 @@ where
                             }
                         }
                         for event in response.to_device.events {
-                            let event = match event.deserialize() {
-                                Ok(event) => event,
-                                Err(_) => continue,
-                            };
                             sender.send(Event::ToDevice(event)).ok();
                         }
                         LoopCtrl::Continue
