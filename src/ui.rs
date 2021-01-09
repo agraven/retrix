@@ -5,22 +5,23 @@ use std::{
 
 use futures::executor::block_on;
 use iced::{
-    Application, Button, Column, Command, Container, Element, Length, Row, Rule, Scrollable,
+    Align, Application, Button, Column, Command, Container, Element, Length, Row, Rule, Scrollable,
     Subscription, Text, TextInput,
 };
 use matrix_sdk::{
-    api::r0::message::get_message_events::{
-        Request as MessageRequest, Response as MessageResponse,
+    api::r0::{
+        media::get_content::Request as ImageRequest,
+        message::get_message_events::{Request as MessageRequest, Response as MessageResponse},
     },
     events::{
         key::verification::cancel::CancelCode as VerificationCancelCode,
-        room::message::MessageEventContent, AnyMessageEvent, AnyMessageEventContent, AnyRoomEvent,
-        AnyStateEvent, AnyToDeviceEvent,
+        room::{member::MembershipState, message::MessageEventContent},
+        AnyMessageEvent, AnyMessageEventContent, AnyRoomEvent, AnyStateEvent, AnyToDeviceEvent,
     },
     identifiers::{EventId, RoomAliasId, RoomId, UserId},
 };
 
-use crate::matrix::{self, AnyRoomEventExt};
+use crate::matrix::{self, AnyMessageEventExt, AnyRoomEventExt};
 
 pub mod prompt;
 pub mod settings;
@@ -39,31 +40,28 @@ pub enum RoomSorting {
 #[derive(Clone, Debug, Default)]
 pub struct RoomEntry {
     /// Cached calculated name
-    name: String,
+    pub name: String,
     /// Room topic
-    topic: String,
+    pub topic: String,
     /// Canonical alias
-    alias: Option<RoomAliasId>,
+    pub alias: Option<RoomAliasId>,
     /// Defined display name
-    display_name: Option<String>,
+    pub display_name: Option<String>,
     /// Person we're in a direct message with
-    direct: Option<UserId>,
+    pub direct: Option<UserId>,
     /// Cache of messages
-    messages: MessageBuffer,
+    pub messages: MessageBuffer,
 }
 
 impl RoomEntry {
-    /// Recalculate displayname
-    pub fn update_display_name(&mut self, id: &RoomId) {
-        self.name = if let Some(ref name) = self.display_name {
-            name.to_owned()
-        } else if let Some(ref user) = self.direct {
-            user.to_string()
-        } else if let Some(ref alias) = self.alias {
-            alias.to_string()
-        } else {
-            id.to_string()
-        };
+    pub fn from_sdk(room: &matrix_sdk::JoinedRoom) -> Self {
+        Self {
+            direct: room.direct_target(),
+            name: block_on(async { room.display_name().await }),
+            topic: room.topic().unwrap_or_default(),
+            alias: room.canonical_alias(),
+            ..Default::default()
+        }
     }
 }
 
@@ -82,6 +80,8 @@ pub struct MessageBuffer {
     end: Option<String>,
     /// Most recent activity in the room
     updated: std::time::SystemTime,
+    /// Whether we're awaiting for backfill to be received
+    loading: bool,
 }
 
 impl MessageBuffer {
@@ -117,6 +117,13 @@ impl MessageBuffer {
         self.sort();
         self.update_time();
     }
+
+    /// Whather the message buffer has the room creation event
+    pub fn has_beginning(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|e| matches!(e, AnyRoomEvent::State(AnyStateEvent::RoomCreate(_))))
+    }
 }
 
 impl Default for MessageBuffer {
@@ -127,6 +134,7 @@ impl Default for MessageBuffer {
             start: None,
             end: None,
             updated: SystemTime::UNIX_EPOCH,
+            loading: false,
         }
     }
 }
@@ -153,6 +161,8 @@ pub struct MainView {
     sorting: RoomSorting,
     /// Room state
     rooms: BTreeMap<RoomId, RoomEntry>,
+    /// A map of mxc urls to image data
+    images: BTreeMap<String, iced::image::Handle>,
 
     /// Room list entries for direct conversations
     dm_buttons: Vec<iced::button::State>,
@@ -162,6 +172,10 @@ pub struct MainView {
     room_scroll: iced::scrollable::State,
     /// Message view scrollbar state
     message_scroll: iced::scrollable::State,
+    /// Backfill fetch button state
+    backfill_button: iced::button::State,
+    /// Button to go the room a tombstone points to
+    tombstone_button: iced::button::State,
     /// Message draft text input
     message_input: iced::text_input::State,
     /// Button to send drafted message
@@ -186,8 +200,11 @@ impl MainView {
             sas: None,
             rooms: Default::default(),
             selected: None,
+            images: Default::default(),
             room_scroll: Default::default(),
             message_scroll: Default::default(),
+            backfill_button: Default::default(),
+            tombstone_button: Default::default(),
             message_input: Default::default(),
             dm_buttons: Vec::new(),
             group_buttons: Vec::new(),
@@ -245,7 +262,12 @@ impl MainView {
             .map(|(idx, button)| {
                 // TODO: highlight selected
                 let (id, room) = dm_rooms[idx];
-                Button::new(button, Text::new(&room.name))
+                let name = if room.name.is_empty() {
+                    "Missing name"
+                } else {
+                    &room.name
+                };
+                Button::new(button, Text::new(name))
                     .width(300.into())
                     .on_press(Message::SelectRoom(id.to_owned()))
             })
@@ -281,10 +303,17 @@ impl MainView {
 
         let mut message_col = Column::new().spacing(5).padding(5);
         let selected_room = match self.selected {
-            Some(ref selected) => self.rooms.get(selected),
+            Some(ref selected) => match (
+                self.rooms.get(selected),
+                self.client.get_joined_room(selected),
+            ) {
+                (Some(room), Some(joined)) => Some((room, joined)),
+                _ => None,
+            },
             None => None,
         };
-        if let Some(room) = selected_room {
+        if let Some((room, joined)) = selected_room {
+            // Include user id or canonical alias in title when appropriate
             let title = if let Some(ref direct) = room.direct {
                 format!("{} ({})", &room.name, direct)
             } else if let Some(ref alias) = room.alias {
@@ -292,29 +321,43 @@ impl MainView {
             } else {
                 room.name.clone()
             };
+
             message_col = message_col
                 .push(Text::new(title).size(25))
                 .push(Rule::horizontal(2));
             let mut scroll = Scrollable::new(&mut self.message_scroll)
                 .scrollbar_width(2)
                 .height(Length::Fill);
+            // Backfill button or loading message
+            let backfill: Element<_> = if room.messages.loading {
+                Text::new("Loading...").into()
+            } else if room.messages.has_beginning() {
+                let creation = joined.create_content().unwrap();
+                let mut col =
+                    Column::new().push(Text::new("This is the beginning of room history"));
+                if let Some(prevous) = creation.predecessor {
+                    col = col.push(
+                        Button::new(&mut self.backfill_button, Text::new("Go to older version"))
+                            .on_press(Message::SelectRoom(prevous.room_id)),
+                    );
+                }
+                col.into()
+            } else {
+                Button::new(&mut self.backfill_button, Text::new("Load more messages"))
+                    .on_press(Message::BackFill(self.selected.clone().unwrap()))
+                    .into()
+            };
+            scroll = scroll.push(Container::new(backfill).width(Length::Fill).center_x());
+            // Messages
             for event in room.messages.messages.iter() {
                 #[allow(clippy::single_match)]
                 match event {
                     AnyRoomEvent::Message(AnyMessageEvent::RoomMessage(message)) => {
-                        let sender = {
-                            match self.client.get_joined_room(&message.room_id) {
-                                Some(backend) => {
-                                    match block_on(async {
-                                        backend.get_member(&message.sender).await
-                                    }) {
-                                        Some(member) => member.name().to_owned(),
-                                        None => message.sender.to_string(),
-                                    }
-                                }
+                        let sender =
+                            match block_on(async { joined.get_member(&message.sender).await }) {
+                                Some(member) => member.name().to_owned(),
                                 None => message.sender.to_string(),
-                            }
-                        };
+                            };
                         let content: Element<_> = match &message.content {
                             MessageEventContent::Audio(audio) => {
                                 Text::new(format!("Audio message: {}", audio.body))
@@ -323,7 +366,7 @@ impl MainView {
                                     .into()
                             }
                             MessageEventContent::Emote(emote) => {
-                                Text::new(format!("{} {}", sender, emote.body))
+                                Text::new(format!("* {} {}", sender, emote.body))
                                     .width(Length::Fill)
                                     .into()
                             }
@@ -334,9 +377,24 @@ impl MainView {
                                     .into()
                             }
                             MessageEventContent::Image(image) => {
-                                Text::new(format!("Image with description: {}", image.body))
-                                    .width(Length::Fill)
-                                    .into()
+                                if let Some(ref url) = image.url {
+                                    match self.images.get(url) {
+                                        Some(handle) => Container::new(
+                                            iced::Image::new(handle.to_owned())
+                                                .width(800.into())
+                                                .height(1200.into()),
+                                        )
+                                        .width(Length::Fill)
+                                        .into(),
+                                        None => {
+                                            Text::new("Image not loaded").width(Length::Fill).into()
+                                        }
+                                    }
+                                } else {
+                                    Text::new("Encrypted images not supported yet")
+                                        .width(Length::Fill)
+                                        .into()
+                                }
                             }
                             MessageEventContent::Notice(notice) => {
                                 Text::new(&notice.body).width(Length::Fill).into()
@@ -366,6 +424,26 @@ impl MainView {
                     }
                     _ => (),
                 }
+            }
+            // Tombstone
+            if let Some(tombstone) = joined.tombstone() {
+                let text = Text::new(format!(
+                    "This room has been upgraded to a new version: {}",
+                    tombstone.body
+                ));
+                let button =
+                    Button::new(&mut self.tombstone_button, Text::new("Go to upgraded room"))
+                        .on_press(Message::SelectRoom(tombstone.replacement_room));
+                scroll = scroll.push(
+                    Container::new(
+                        Column::new()
+                            .push(text)
+                            .push(button)
+                            .align_items(Align::Center),
+                    )
+                    .center_x()
+                    .width(Length::Fill),
+                );
             }
             message_col = message_col.push(scroll);
         } else {
@@ -490,6 +568,10 @@ pub enum Message {
     BackFill(RoomId),
     /// Received backfille
     BackFilled(RoomId, MessageResponse),
+    /// Fetch an image pointed to by an mxc url
+    FetchImage(String),
+    /// Fetched an image
+    FetchedImage(String, iced::image::Handle),
     /// View messages from this room
     SelectRoom(RoomId),
     /// Set error message
@@ -637,48 +719,25 @@ impl Application for Retrix {
                     *self = Retrix::LoggedIn(MainView::new(client.clone(), session));
                     let mut commands: Vec<Command<Message>> = Vec::new();
                     for room in client.joined_rooms().into_iter() {
-                        let command = async move {
+                        //let client = client.clone();
+                        let command: Command<_> = async move {
                             let room = room.clone();
-                            let entry = RoomEntry {
-                                direct: room.direct_target(),
-                                name: block_on(async { room.calculate_name().await }),
-                                topic: room.topic().unwrap_or_default(),
-                                ..RoomEntry::default()
-                            };
+                            let entry = RoomEntry::from_sdk(&room);
 
                             // Display name calculation for DMs is bronk so we're doing it
                             // ourselves
-                            /*match entry.direct {
-                                Some(ref direct) => {
-                                    let request = matrix_sdk::api::r0::profile::get_display_name::Request::new(direct);
-                                    if let Ok(response) = client.send(request).await {
-                                        if let Some(name) = response.displayname {
-                                            entry.name = name;
-                                        }
+                            /*if let Some(ref direct) = entry.direct {
+                                let request = DisplayNameRequest::new(direct);
+                                if let Ok(response) = client.send(request).await {
+                                    if let Some(name) = response.displayname {
+                                        entry.name = name;
                                     }
                                 }
-                                None => entry.name = room.display_name(),
                             }*/
-                            /*let messages = room
-                                .messages
-                                .iter()
-                                .cloned()
-                                .map(|event| match event {
-                                    AnyPossiblyRedactedSyncMessageEvent::Redacted(e) => {
-                                        AnyRoomEvent::RedactedMessage(
-                                            e.into_full_event(id.clone()),
-                                        )
-                                    }
-                                    AnyPossiblyRedactedSyncMessageEvent::Regular(e) => {
-                                        AnyRoomEvent::Message(e.into_full_event(id.clone()))
-                                    }
-                                })
-                            .collect();
-                            entry.messages.messages = messages;*/
                             Message::ResetRoom(room.room_id().to_owned(), entry)
                         }
                         .into();
-                        commands.push(command)
+                        commands.push(command);
                     }
                     return Command::batch(commands);
                 }
@@ -689,38 +748,57 @@ impl Application for Retrix {
                 Message::ClearError => view.error = None,
                 Message::SetSort(s) => view.sorting = s,
                 Message::ResetRoom(id, room) => {
-                    view.rooms.insert(id, room).and(Some(())).unwrap_or(())
+                    view.rooms.insert(id.clone(), room);
+                    return async move { Message::BackFill(id) }.into();
                 }
                 Message::SelectRoom(r) => {
                     view.selected = Some(r.clone());
-                    return async move { Message::BackFill(r) }.into();
+                    if view.rooms.get(&r).unwrap().messages.messages.is_empty() {
+                        return async move { Message::BackFill(r) }.into();
+                    }
                 }
                 Message::Sync(event) => match event {
                     matrix::Event::Room(event) => match event {
                         AnyRoomEvent::Message(event) => {
                             let room = view.rooms.entry(event.room_id().clone()).or_default();
                             room.messages.push(AnyRoomEvent::Message(event.clone()));
+                            let mut commands = Vec::new();
+                            let img_cmd = match event.image_url() {
+                                Some(url) => async { Message::FetchImage(url) }.into(),
+                                None => Command::none(),
+                            };
+                            commands.push(img_cmd);
                             // Set read marker if message is in selected room
                             if view.selected.as_ref() == Some(event.room_id()) {
+                                // Super duper gross ugly scroll to bottom hack
+                                /*view.message_scroll = unsafe {
+                                    let mut tmp = std::mem::transmute::<_, (Option<f32>, f32)>(
+                                        view.message_scroll,
+                                    );
+                                    tmp.1 = 999999.0;
+                                    std::mem::transmute::<_, iced::scrollable::State>(tmp)
+                                };*/
+
                                 let client = view.client.clone();
-                                return Command::perform(
-                                    async move {
-                                        client
-                                            .read_marker(
-                                                event.room_id(),
-                                                event.event_id(),
-                                                Some(event.event_id()),
-                                            )
-                                            .await
-                                            .err()
-                                    },
-                                    |result| match result {
+                                let marker_cmd = async move {
+                                    let result = client
+                                        .read_marker(
+                                            event.room_id(),
+                                            event.event_id(),
+                                            Some(event.event_id()),
+                                        )
+                                        .await
+                                        .err();
+                                    match result {
                                         Some(err) => Message::ErrorMessage(err.to_string()),
                                         // TODO: Make this an actual no-op
                                         None => Message::Login,
-                                    },
-                                );
+                                    }
+                                }
+                                .into();
+                                commands.push(marker_cmd);
                             }
+                            return Command::batch(commands);
                         }
                         AnyRoomEvent::State(event) => match event {
                             AnyStateEvent::RoomCanonicalAlias(ref alias) => {
@@ -731,11 +809,44 @@ impl Application for Retrix {
                             AnyStateEvent::RoomName(ref name) => {
                                 let room = view.rooms.entry(name.room_id.clone()).or_default();
                                 room.display_name = name.content.name().map(String::from);
+                                if let Some(joined) = view.client.get_joined_room(&name.room_id) {
+                                    room.name = block_on(async { joined.display_name().await });
+                                }
                                 room.messages.push(AnyRoomEvent::State(event));
                             }
                             AnyStateEvent::RoomTopic(ref topic) => {
                                 let room = view.rooms.entry(topic.room_id.clone()).or_default();
                                 room.topic = topic.content.topic.clone();
+                                room.messages.push(AnyRoomEvent::State(event));
+                            }
+                            AnyStateEvent::RoomCreate(ref create) => {
+                                // Add room to the entry list
+                                let room = match view.client.get_joined_room(&create.room_id) {
+                                    Some(joined) => view
+                                        .rooms
+                                        .entry(create.room_id.clone())
+                                        .or_insert_with(|| RoomEntry::from_sdk(&joined)),
+                                    None => view.rooms.entry(create.room_id.clone()).or_default(),
+                                };
+                                room.messages.push(AnyRoomEvent::State(event));
+                            }
+                            AnyStateEvent::RoomMember(ref member) => {
+                                let room = view.rooms.entry(member.room_id.clone()).or_default();
+                                let client = view.client.clone();
+                                // If we left a room, remove it from the RoomEntry list
+                                let own_id = block_on(async { client.user_id().await })
+                                    .unwrap()
+                                    .to_string();
+                                if member.content.membership == MembershipState::Leave
+                                    && member.state_key == own_id
+                                {
+                                    // Deselect room if we're leaving selected room
+                                    if view.selected.as_ref() == Some(&member.room_id) {
+                                        view.selected = None;
+                                    }
+                                    view.rooms.remove(&member.room_id);
+                                    return Command::none();
+                                }
                                 room.messages.push(AnyRoomEvent::State(event));
                             }
                             ref any => {
@@ -768,7 +879,8 @@ impl Application for Retrix {
                     }
                 },
                 Message::BackFill(id) => {
-                    let room = view.rooms.get(&id).unwrap();
+                    let room = view.rooms.entry(id.clone()).or_default();
+                    room.messages.loading = true;
                     let client = view.client.clone();
                     let token = match room.messages.end.clone() {
                         Some(end) => end,
@@ -789,6 +901,7 @@ impl Application for Retrix {
                 }
                 Message::BackFilled(id, response) => {
                     let room = view.rooms.get_mut(&id).unwrap();
+                    room.messages.loading = false;
                     let events: Vec<AnyRoomEvent> = response
                         .chunk
                         .into_iter()
@@ -807,7 +920,41 @@ impl Application for Retrix {
                     if let Some(end) = response.end {
                         room.messages.end = Some(end);
                     }
+                    let commands: Vec<Command<_>> = events
+                        .iter()
+                        .filter_map(|e| e.image_url())
+                        .map(|url| async { Message::FetchImage(url) }.into())
+                        .collect();
                     room.messages.append(events);
+                    return Command::batch(commands);
+                }
+                Message::FetchImage(url) => {
+                    let (server, path) = match matrix::parse_mxc(&url) {
+                        Ok((server, path)) => (server, path),
+                        Err(e) => {
+                            return async move { Message::ErrorMessage(e.to_string()) }.into()
+                        }
+                    };
+                    println!(
+                        "Getting '{}' from '{}', with url '{}'",
+                        &server, &path, &url
+                    );
+                    let client = view.client.clone();
+                    return async move {
+                        let request = ImageRequest::new(&path, &*server);
+                        let response = client.send(request).await;
+                        match response {
+                            Ok(response) => Message::FetchedImage(
+                                url,
+                                iced::image::Handle::from_memory(response.file),
+                            ),
+                            Err(e) => Message::ErrorMessage(e.to_string()),
+                        }
+                    }
+                    .into();
+                }
+                Message::FetchedImage(url, handle) => {
+                    view.images.insert(url, handle);
                 }
                 Message::SetVerification(v) => view.sas = v,
                 Message::VerificationAccept => {
@@ -965,13 +1112,13 @@ impl Application for Retrix {
 }
 
 fn format_systime(time: std::time::SystemTime) -> String {
-    let secs = time
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!(
-        "{:02}:{:02}",
-        (secs % (60 * 60 * 24)) / (60 * 60),
-        (secs % (60 * 60)) / 60
-    )
+    let offset = time::UtcOffset::try_current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    let time = time::OffsetDateTime::from(time).to_offset(offset);
+    let today = time::OffsetDateTime::now_utc().to_offset(offset).date();
+    // Display
+    if time.date() == today {
+        time.format("%T")
+    } else {
+        time.format("%F %T")
+    }
 }

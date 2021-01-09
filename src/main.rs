@@ -1,8 +1,7 @@
-extern crate crossbeam_channel as channel;
 extern crate dirs_next as dirs;
 
-use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
 use iced::Application;
 
@@ -16,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Make sure config dir exists and is not accessible by other users.
     if !config_dir.is_dir() {
         std::fs::create_dir(&config_dir)?;
+        #[cfg(unix)]
         std::fs::set_permissions(&config_dir, Permissions::from_mode(0o700))?;
     }
 

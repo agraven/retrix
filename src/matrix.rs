@@ -1,9 +1,16 @@
-use std::time::{Duration, SystemTime};
+use std::{
+    convert::TryFrom,
+    time::{Duration, SystemTime},
+};
 
+use async_stream::stream;
 use matrix_sdk::{
     api::r0::{account::register::Request as RegistrationRequest, uiaa::AuthData},
-    events::{AnyRoomEvent, AnySyncRoomEvent, AnyToDeviceEvent},
-    identifiers::{DeviceId, EventId, UserId},
+    events::{
+        room::message::{MessageEvent, MessageEventContent},
+        AnyMessageEvent, AnyRoomEvent, AnySyncRoomEvent, AnyToDeviceEvent,
+    },
+    identifiers::{DeviceId, EventId, ServerName, UserId},
     reqwest::Url,
     Client, ClientConfig, LoopCtrl, SyncSettings,
 };
@@ -67,6 +74,7 @@ pub async fn signup(
     });
 
     let response = client.register(request).await?;
+    client.sync_once(SyncSettings::new()).await?;
 
     let session = Session {
         access_token: response.access_token.unwrap(),
@@ -103,7 +111,7 @@ pub async fn login(
         homeserver: server.to_owned(),
     };
     write_session(&session)?;
-    //client.sync_once(SyncSettings::new()).await?;
+    client.sync_once(SyncSettings::new()).await?;
 
     Ok((client, session))
 }
@@ -150,6 +158,19 @@ fn write_session(session: &Session) -> Result<(), Error> {
     Ok(())
 }
 
+/// Break down an mxc url to its authority and path
+pub fn parse_mxc(url: &str) -> Result<(Box<ServerName>, String), Error> {
+    let url = Url::parse(&url)?;
+    anyhow::ensure!(url.scheme() == "mxc", "Not an mxc url");
+    let host = url.host_str().ok_or(anyhow::anyhow!("url"))?;
+    let server_name: Box<ServerName> = <&ServerName>::try_from(host)?.into();
+    let path = url.path_segments().and_then(|mut p| p.next());
+    match path {
+        Some(path) => Ok((server_name, path.to_owned())),
+        _ => Err(anyhow::anyhow!("Invalid mxc url")),
+    }
+}
+
 pub struct MatrixSync {
     client: matrix_sdk::Client,
     join: Option<tokio::task::JoinHandle<()>>,
@@ -161,21 +182,6 @@ impl MatrixSync {
         iced::Subscription::from_recipe(MatrixSync { client, join: None })
     }
 }
-
-/*#[async_trait]
-impl EventEmitter for Callback {
-    async fn on_room_message(&self, room: SyncRoom, event: &SyncMessageEvent<MessageEventContent>) {
-        let room_id = if let matrix_sdk::RoomState::Joined(arc) = room {
-            let room = arc.read().await;
-            room.room_id.clone()
-        } else {
-            return;
-        };
-        self.sender
-            .send(event.clone().into_full_event(room_id))
-            .ok();
-    }
-}*/
 
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -201,13 +207,13 @@ where
         mut self: Box<Self>,
         _input: iced_futures::BoxStream<I>,
     ) -> iced_futures::BoxStream<Self::Output> {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let client = self.client.clone();
         let join = tokio::task::spawn(async move {
             client
                 .sync_with_callback(
                     SyncSettings::new()
-                        //.token(client.sync_token().await.unwrap())
+                        .token(client.sync_token().await.unwrap())
                         .timeout(Duration::from_secs(90))
                         .full_state(true),
                     |response| async {
@@ -241,14 +247,22 @@ where
                 .await;
         });
         self.join = Some(join);
-        Box::pin(receiver)
+        let stream = stream! {
+            while let Some(item) = receiver.recv().await {
+                yield item;
+            }
+        };
+        Box::pin(stream)
     }
 }
 
 pub trait AnyRoomEventExt {
+    /// Gets the event id of the underlying event
     fn event_id(&self) -> &EventId;
     /// Gets the ´origin_server_ts` member of the underlying event
     fn origin_server_ts(&self) -> SystemTime;
+    /// Gets the mxc url in a message event if there is noe
+    fn image_url(&self) -> Option<String>;
 }
 
 impl AnyRoomEventExt for AnyRoomEvent {
@@ -268,5 +282,27 @@ impl AnyRoomEventExt for AnyRoomEvent {
             AnyRoomEvent::RedactedState(e) => e.origin_server_ts(),
         }
         .to_owned()
+    }
+    fn image_url(&self) -> Option<String> {
+        match self {
+            AnyRoomEvent::Message(message) => message.image_url(),
+            _ => None,
+        }
+    }
+}
+
+pub trait AnyMessageEventExt {
+    fn image_url(&self) -> Option<String>;
+}
+
+impl AnyMessageEventExt for AnyMessageEvent {
+    fn image_url(&self) -> Option<String> {
+        match self {
+            AnyMessageEvent::RoomMessage(MessageEvent {
+                content: MessageEventContent::Image(ref image),
+                ..
+            }) => image.url.clone(),
+            _ => None,
+        }
     }
 }
