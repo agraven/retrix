@@ -9,12 +9,12 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0"
 async-stream = "0.3"
+async-trait = "0.1"
 dirs-next = "2.0"
 futures = "0.3"
 iced = { git = "https://github.com/hecrj/iced", rev = "31522e3", features = ["debug", "image", "tokio"] }
 iced_futures = { git = "https://github.com/hecrj/iced", rev = "31522e3" }
 #iced_glow = { git = "https://github.com/hecrj/iced", rev = "31522e3", features = ["image"] }
-#matrix-sdk-common-macros = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "e65915e" }
 serde = { version = "1.0", features = ["derive"] }
 time = "0.2"
 tokio = { version = "1.0", features = ["sync"] }
@@ -23,7 +23,7 @@ tracing-subscriber = { version = "0.2", features = ["parking_lot"] }
 
 [dependencies.matrix-sdk]
 git = "https://github.com/matrix-org/matrix-rust-sdk"
-rev = "6435269"
+rev = "40c53f0"
 default_features = false
 features = ["encryption", "sqlite_cryptostore", "messages", "rustls-tls", "unstable-synapse-quirks"]
 

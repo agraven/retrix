@@ -22,9 +22,9 @@ pub type Error = anyhow::Error;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Session {
     access_token: String,
-    user_id: UserId,
-    device_id: Box<DeviceId>,
-    homeserver: String,
+    pub user_id: UserId,
+    pub device_id: Box<DeviceId>,
+    pub homeserver: String,
 }
 
 impl From<Session> for matrix_sdk::Session {
@@ -121,7 +121,7 @@ pub async fn restore_login(session: Session) -> Result<(Client, Session), Error>
     let client = client(url)?;
 
     client.restore_login(session.clone().into()).await?;
-    //client.sync_once(SyncSettings::new()).await?;
+    client.sync_once(SyncSettings::new()).await?;
 
     Ok((client, session))
 }
@@ -162,7 +162,7 @@ fn write_session(session: &Session) -> Result<(), Error> {
 pub fn parse_mxc(url: &str) -> Result<(Box<ServerName>, String), Error> {
     let url = Url::parse(&url)?;
     anyhow::ensure!(url.scheme() == "mxc", "Not an mxc url");
-    let host = url.host_str().ok_or(anyhow::anyhow!("url"))?;
+    let host = url.host_str().ok_or_else(|| anyhow::anyhow!("url"))?;
     let server_name: Box<ServerName> = <&ServerName>::try_from(host)?.into();
     let path = url.path_segments().and_then(|mut p| p.next());
     match path {
@@ -190,6 +190,45 @@ pub enum Event {
     Token(String),
 }
 
+/*pub enum Sync {
+    MessageInvited()
+    MessageJoined(RoomId, AnyRoomEvent),
+    MessageLeft(RoomId, AnyRoomEvent),
+}
+
+struct Emitter {
+    client: Client,
+    sender: tokio::sync::mpsc::Sender<Sync>,
+}
+
+#[async_trait]
+impl matrix_sdk::EventEmitter for Emitter {
+    async fn on_room_message(
+        &self,
+        room: RoomState,
+        message: &SyncMessageEvent<MessageEventContent>,
+    ) {
+        let id = room.room_id().to_owned();
+        let full = AnyRoomEvent::Message(
+            AnyMessageEvent::RoomMessage(
+                message
+                .to_owned()
+                .into_full_event(id.clone()),
+            ),
+        );
+        if let RoomState::Joined(room) = room {
+            self.sender
+                .send(Sync::MessageJoined(id, full))
+                .await
+                .ok();
+        }
+    }
+
+    async fn on_room_member(&self, room: RoomState, member: &SyncStateEvent<MemberEventContent>) {
+
+    }
+}*/
+
 impl<H, I> iced_futures::subscription::Recipe<H, I> for MatrixSync
 where
     H: std::hash::Hasher,
@@ -214,11 +253,18 @@ where
                 .sync_with_callback(
                     SyncSettings::new()
                         .token(client.sync_token().await.unwrap())
-                        .timeout(Duration::from_secs(90))
-                        .full_state(true),
+                        .timeout(Duration::from_secs(30)),
                     |response| async {
-                        sender.send(Event::Token(response.next_batch)).ok();
+                        //sender.send(Event::Token(response.next_batch)).ok();
                         for (id, room) in response.rooms.join {
+                            for event in room.state.events {
+                                let id = id.clone();
+                                sender
+                                    .send(Event::Room(AnyRoomEvent::State(
+                                        event.into_full_event(id),
+                                    )))
+                                    .ok();
+                            }
                             for event in room.timeline.events {
                                 let id = id.clone();
                                 let event = match event {
