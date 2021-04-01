@@ -17,7 +17,7 @@ use matrix_sdk::{
         key::verification::cancel::CancelCode as VerificationCancelCode,
         room::{
             member::MembershipState,
-            message::{MessageEventContent, Relation, TextMessageEventContent},
+            message::{MessageEventContent, MessageType, Relation},
         },
         AnyMessageEvent, AnyMessageEventContent, AnyRoomEvent, AnyStateEvent, AnyToDeviceEvent,
     },
@@ -28,9 +28,12 @@ use crate::matrix::{self, AnyMessageEventExt, AnyRoomEventExt};
 
 pub mod prompt;
 pub mod settings;
+pub mod theme;
 
 use prompt::{PromptAction, PromptView};
 use settings::SettingsView;
+
+const THUMBNAIL_SIZE: u32 = 48;
 
 /// What order to sort rooms in in the room list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,10 +62,10 @@ pub struct RoomEntry {
 }
 
 impl RoomEntry {
-    pub async fn from_sdk(room: &matrix_sdk::JoinedRoom) -> Self {
+    pub async fn from_sdk(room: &matrix_sdk::room::Joined) -> Self {
         Self {
             direct: room.direct_target(),
-            name: room.display_name().await,
+            name: room.display_name().await.unwrap(),
             topic: room.topic().unwrap_or_default(),
             alias: room.canonical_alias(),
             avatar: room.avatar_url(),
@@ -116,10 +119,10 @@ impl MessageBuffer {
         if let AnyRoomEvent::Message(AnyMessageEvent::RoomMessage(
             matrix_sdk::events::MessageEvent {
                 content:
-                    MessageEventContent::Text(TextMessageEventContent {
+                    MessageEventContent {
                         relates_to: Some(Relation::Replacement(ref replacement)),
                         ..
-                    }),
+                    },
                 ..
             },
         )) = event
@@ -142,10 +145,10 @@ impl MessageBuffer {
             if let AnyRoomEvent::Message(AnyMessageEvent::RoomMessage(
                 matrix_sdk::events::MessageEvent {
                     content:
-                        MessageEventContent::Text(TextMessageEventContent {
+                        MessageEventContent {
                             relates_to: Some(Relation::Replacement(replacement)),
                             ..
-                        }),
+                        },
                     ..
                 },
             )) = event
@@ -207,6 +210,8 @@ pub struct MainView {
     rooms: BTreeMap<RoomId, RoomEntry>,
     /// A map of mxc urls to image data
     images: BTreeMap<String, iced::image::Handle>,
+    /// A map of mxc urls to image thumbnails
+    thumbnails: BTreeMap<String, iced::image::Handle>,
 
     /// Room list entries for direct conversations
     dm_buttons: Vec<iced::button::State>,
@@ -245,6 +250,7 @@ impl MainView {
             rooms: Default::default(),
             selected: None,
             images: Default::default(),
+            thumbnails: Default::default(),
             room_scroll: Default::default(),
             message_scroll: Default::default(),
             backfill_button: Default::default(),
@@ -298,7 +304,7 @@ impl MainView {
             Vec<(&RoomId, &RoomEntry)>,
         ) = rooms
             .iter()
-            // Hide if we're in the room the tombstone points to
+            // Hide if have joined the room the tombstone points to
             .filter(|(id, _)| {
                 !client
                     .get_joined_room(id)
@@ -324,6 +330,7 @@ impl MainView {
         self.group_buttons
             .resize_with(group_rooms.len(), Default::default);
         // Create buttons
+        let thumbnails = &self.thumbnails;
         let images = &self.images;
         let dm_buttons: Vec<Button<_>> = self
             .dm_buttons
@@ -333,13 +340,13 @@ impl MainView {
                 // TODO: highlight selected
                 let (id, room) = unsafe { dm_rooms.get_unchecked(idx) };
                 let name = if room.name.is_empty() {
-                    "Missing name"
+                    "Empty room"
                 } else {
                     &room.name
                 };
                 let mut row = Row::new().align_items(Align::Center);
                 if let Some(ref url) = room.avatar {
-                    if let Some(handle) = images.get(url) {
+                    if let Some(handle) = thumbnails.get(url) {
                         row = row.push(
                             Image::new(handle.clone())
                                 .width(20.into())
@@ -467,32 +474,30 @@ impl MainView {
                             sender = match block_on(async {
                                 joined.get_member(&message.sender).await
                             }) {
-                                Some(member) => member.name().to_owned(),
-                                None => message.sender.to_string(),
+                                Ok(Some(member)) => member.name().to_owned(),
+                                _ => message.sender.to_string(),
                             };
                             scroll = scroll
                                 .push(iced::Space::with_height(4.into()))
                                 .push(Text::new(&sender).color([0.0, 0.0, 1.0]));
                         }
-                        let content: Element<_> = match &message.content {
-                            MessageEventContent::Audio(audio) => {
+                        let content: Element<_> = match &message.content.msgtype {
+                            MessageType::Audio(audio) => {
                                 Text::new(format!("Audio message: {}", audio.body))
                                     .color([0.2, 0.2, 0.2])
                                     .width(Length::Fill)
                                     .into()
                             }
-                            MessageEventContent::Emote(emote) => {
+                            MessageType::Emote(emote) => {
                                 Text::new(format!("* {} {}", sender, emote.body))
                                     .width(Length::Fill)
                                     .into()
                             }
-                            MessageEventContent::File(file) => {
-                                Text::new(format!("File '{}'", file.body))
-                                    .color([0.2, 0.2, 0.2])
-                                    .width(Length::Fill)
-                                    .into()
-                            }
-                            MessageEventContent::Image(image) => {
+                            MessageType::File(file) => Text::new(format!("File '{}'", file.body))
+                                .color([0.2, 0.2, 0.2])
+                                .width(Length::Fill)
+                                .into(),
+                            MessageType::Image(image) => {
                                 if let Some(ref url) = image.url {
                                     match self.images.get(url) {
                                         Some(handle) => Container::new(
@@ -512,16 +517,16 @@ impl MainView {
                                         .into()
                                 }
                             }
-                            MessageEventContent::Notice(notice) => {
+                            MessageType::Notice(notice) => {
                                 Text::new(&notice.body).width(Length::Fill).into()
                             }
-                            MessageEventContent::ServerNotice(notice) => {
+                            MessageType::ServerNotice(notice) => {
                                 Text::new(&notice.body).width(Length::Fill).into()
                             }
-                            MessageEventContent::Text(text) => {
+                            MessageType::Text(text) => {
                                 Text::new(&text.body).width(Length::Fill).into()
                             }
-                            MessageEventContent::Video(video) => {
+                            MessageType::Video(video) => {
                                 Text::new(format!("Video: {}", video.body))
                                     .color([0.2, 0.2, 0.2])
                                     .into()
@@ -658,6 +663,389 @@ impl MainView {
 
         root_row.into()
     }
+
+    fn update(&mut self, message: Message) -> Command<Message> {
+        let view = self;
+        match message {
+            Message::ErrorMessage(e) => view.error = Some((e, Default::default())),
+            Message::ClearError => view.error = None,
+            Message::SetSort(s) => view.sorting = s,
+            Message::ResetRoom(id, room) => {
+                view.rooms.insert(id.clone(), room);
+                return async move { Message::BackFill(id) }.into();
+            }
+            Message::SelectRoom(r) => {
+                view.selected = Some(r.clone());
+                if view.rooms.get(&r).unwrap().messages.messages.is_empty() {
+                    return async move { Message::BackFill(r) }.into();
+                }
+            }
+            Message::Sync(event) => match event {
+                matrix::Event::Joined(event, joined) => match event {
+                    AnyRoomEvent::Message(event) => {
+                        let room = view.rooms.entry(event.room_id().clone()).or_default();
+                        room.messages.push(AnyRoomEvent::Message(event.clone()));
+                        let mut commands = Vec::new();
+                        // Add fetch image command if the message has an image
+                        let img_cmd = match event.image_url() {
+                            Some(url) => async { Message::FetchImage(url) }.into(),
+                            None => Command::none(),
+                        };
+                        commands.push(img_cmd);
+                        // Set read marker if message is in selected room
+                        /*if view.selected.as_ref() == Some(event.room_id()) {
+                          let client = view.client.clone();
+                          let marker_cmd = async move {
+                          let result = client
+                          .read_marker(
+                          event.room_id(),
+                          event.event_id(),
+                          Some(event.event_id()),
+                          )
+                          .await
+                          .err();
+                          match result {
+                          Some(err) => Message::ErrorMessage(err.to_string()),
+                        // TODO: Make this an actual no-op
+                        None => Message::Login,
+                        }
+                        }
+                        .into();
+                        commands.push(marker_cmd);
+                        }*/
+
+                        return Command::batch(commands);
+                    }
+                    AnyRoomEvent::State(event) => match event {
+                        AnyStateEvent::RoomCanonicalAlias(ref alias) => {
+                            let room = view.rooms.entry(alias.room_id.clone()).or_default();
+                            room.alias = alias.content.alias.clone();
+                            room.messages.push(AnyRoomEvent::State(event));
+                        }
+                        AnyStateEvent::RoomName(ref name) => {
+                            let id = name.room_id.clone();
+                            let room = view.rooms.entry(id.clone()).or_default();
+                            room.display_name = name.content.name().map(String::from);
+                            room.messages.push(AnyRoomEvent::State(event));
+                            let client = view.client.clone();
+                            return async move {
+                                let joined = client.get_joined_room(&id).unwrap();
+                                match joined.display_name().await {
+                                    Ok(name) => Message::RoomName(id, name),
+                                    Err(e) => Message::ErrorMessage(e.to_string()),
+                                }
+                            }
+                            .into();
+                        }
+                        AnyStateEvent::RoomTopic(ref topic) => {
+                            let room = view.rooms.entry(topic.room_id.clone()).or_default();
+                            room.topic = topic.content.topic.clone();
+                            room.messages.push(AnyRoomEvent::State(event));
+                        }
+                        AnyStateEvent::RoomAvatar(ref avatar) => {
+                            let room = view.rooms.entry(avatar.room_id.clone()).or_default();
+                            room.messages.push(AnyRoomEvent::State(event));
+                            if let Some(url) = room.avatar.clone() {
+                                room.avatar = Some(url.clone());
+                                //return async { Message::FetchThumb(url) }.into();
+                                return Command::none();
+                            }
+                        }
+                        AnyStateEvent::RoomCreate(ref create) => {
+                            // Add room to the entry list
+                            let joined = view.client.get_joined_room(&create.room_id).unwrap();
+                            let id = create.room_id.clone();
+                            return async move {
+                                let mut entry = RoomEntry::from_sdk(&joined).await;
+                                entry.messages.push(AnyRoomEvent::State(event));
+                                Message::ResetRoom(id, entry)
+                            }
+                            .into();
+                        }
+                        AnyStateEvent::RoomMember(ref member) => {
+                            let room = view.rooms.entry(member.room_id.clone()).or_default();
+                            let client = view.client.clone();
+                            // If we left a room, remove it from the RoomEntry list
+                            if member.state_key == view.session.user_id {
+                                match member.content.membership {
+                                    MembershipState::Join => {
+                                        let id = member.room_id.clone();
+                                        return async move {
+                                            let joined = client.get_joined_room(&id).unwrap();
+                                            let entry = RoomEntry::from_sdk(&joined).await;
+
+                                            Message::ResetRoom(id, entry)
+                                        }
+                                        .into();
+                                    }
+                                    MembershipState::Leave => {
+                                        // Deselect room if we're leaving selected room
+                                        if view.selected.as_ref() == Some(&member.room_id) {
+                                            view.selected = None;
+                                        }
+                                        view.rooms.remove(&member.room_id);
+                                        return Command::none();
+                                    }
+                                    _ => (),
+                                }
+                            }
+                            room.messages.push(AnyRoomEvent::State(event));
+                        }
+                        ref any => {
+                            // Ensure room exists
+                            let room = view.rooms.entry(any.room_id().clone()).or_default();
+                            room.messages.push(AnyRoomEvent::State(event));
+                        }
+                    },
+                    AnyRoomEvent::RedactedMessage(redacted) => {
+                        let room = view.rooms.entry(redacted.room_id().clone()).or_default();
+                        room.messages.push(AnyRoomEvent::RedactedMessage(redacted));
+                    }
+                    AnyRoomEvent::RedactedState(redacted) => {
+                        let room = view.rooms.entry(redacted.room_id().clone()).or_default();
+                        room.messages.push(AnyRoomEvent::RedactedState(redacted));
+                    }
+                },
+                matrix::Event::ToDevice(event) => match event {
+                    AnyToDeviceEvent::KeyVerificationStart(start) => {
+                        let client = view.client.clone();
+                        return Command::perform(
+                            async move { client.get_verification(&start.content.transaction_id).await },
+                            Message::SetVerification,
+                        );
+                    }
+                    AnyToDeviceEvent::KeyVerificationCancel(cancel) => {
+                        return async { Message::VerificationCancelled(cancel.content.code) }
+                            .into();
+                    }
+                    _ => (),
+                },
+                matrix::Event::Token(token) => {
+                    view.sync_token = token;
+                }
+                _ => (),
+            },
+            Message::BackFill(id) => {
+                let entry = view.rooms.entry(id.clone()).or_default();
+                entry.messages.loading = true;
+                let client = view.client.clone();
+                let room = client.get_joined_room(&id).unwrap();
+                let token = match entry.messages.end.clone() {
+                    Some(end) => end,
+                    None => room
+                        .last_prev_batch()
+                        .unwrap_or_else(|| view.sync_token.clone()),
+                };
+                return async move {
+                    let mut request = MessageRequest::backward(&id, &token);
+                    request.limit = matrix_sdk::uint!(30);
+                    match room.messages(request).await {
+                        Ok(response) => Message::BackFilled(id, response),
+                        Err(e) => Message::ErrorMessage(e.to_string()),
+                    }
+                }
+                .into();
+            }
+            Message::BackFilled(id, response) => {
+                let room = view.rooms.get_mut(&id).unwrap();
+                room.messages.loading = false;
+                let events: Vec<AnyRoomEvent> = response
+                    .chunk
+                    .into_iter()
+                    .filter_map(|e| e.deserialize().ok())
+                    .chain(
+                        response
+                            .state
+                            .into_iter()
+                            .filter_map(|e| e.deserialize().ok().map(AnyRoomEvent::State)),
+                    )
+                    .collect();
+
+                if let Some(start) = response.start {
+                    room.messages.start = Some(start);
+                }
+                if let Some(end) = response.end {
+                    room.messages.end = Some(end);
+                }
+                let commands: Vec<Command<_>> = events
+                    .iter()
+                    .filter_map(|e| e.image_url())
+                    .map(|url| async { Message::FetchImage(url) }.into())
+                    .collect();
+                room.messages.append(events);
+                return Command::batch(commands);
+            }
+
+            Message::FetchImage(url) => {
+                let (server, path) = match matrix::parse_mxc(&url) {
+                    Ok((server, path)) => (server, path),
+                    Err(e) => return async move { Message::ErrorMessage(e.to_string()) }.into(),
+                };
+                let client = view.client.clone();
+                return async move {
+                    let request = ImageRequest::new(&path, &*server);
+                    let response = client.send(request, None).await;
+                    match response {
+                        Ok(response) => Message::FetchedImage(
+                            url,
+                            iced::image::Handle::from_memory(response.file),
+                        ),
+                        Err(e) => Message::ErrorMessage(e.to_string()),
+                    }
+                }
+                .into();
+            }
+            Message::FetchedImage(url, handle) => {
+                view.images.insert(url, handle);
+            }
+            Message::FetchedThumbnail(url, handle) => {
+                view.thumbnails.insert(url, handle);
+            }
+            Message::RoomName(id, name) => {
+                if let Some(room) = view.rooms.get_mut(&id) {
+                    room.name = name;
+                }
+            }
+            Message::SetVerification(v) => view.sas = v,
+            Message::VerificationAccept => {
+                let sas = match &view.sas {
+                    Some(sas) => sas.clone(),
+                    None => return Command::none(),
+                };
+                return Command::perform(
+                    async move { sas.accept().await },
+                    |result| match result {
+                        Ok(()) => Message::VerificationAccepted,
+                        Err(e) => Message::ErrorMessage(e.to_string()),
+                    },
+                );
+            }
+            Message::VerificationConfirm => {
+                let sas = match &view.sas {
+                    Some(sas) => sas.clone(),
+                    None => return Command::none(),
+                };
+                return Command::perform(
+                    async move { sas.confirm().await },
+                    |result| match result {
+                        Ok(()) => Message::VerificationConfirmed,
+                        Err(e) => Message::ErrorMessage(e.to_string()),
+                    },
+                );
+            }
+            Message::VerificationCancel => {
+                let sas = match &view.sas {
+                    Some(sas) => sas.clone(),
+                    None => return Command::none(),
+                };
+                return Command::perform(
+                    async move { sas.cancel().await },
+                    |result| match result {
+                        Ok(()) => Message::VerificationCancelled(VerificationCancelCode::User),
+                        Err(e) => Message::ErrorMessage(e.to_string()),
+                    },
+                );
+            }
+            Message::VerificationCancelled(code) => {
+                view.sas = None;
+                return async move { Message::ErrorMessage(code.as_str().to_owned()) }.into();
+            }
+            Message::VerificationClose => view.sas = None,
+            Message::SetMessage(m) => view.draft = m,
+            Message::SendMessage => {
+                let selected = match view.selected.clone() {
+                    Some(selected) => selected,
+                    None => return Command::none(),
+                };
+                let draft = view.draft.clone();
+                let client = view.client.clone();
+                return Command::perform(
+                    async move {
+                        client
+                            .room_send(
+                                &selected,
+                                AnyMessageEventContent::RoomMessage(
+                                    MessageEventContent::text_plain(draft),
+                                ),
+                                None,
+                            )
+                            .await
+                    },
+                    |result| match result {
+                        Ok(_) => Message::SetMessage(String::new()),
+                        Err(e) => Message::ErrorMessage(e.to_string()),
+                    },
+                );
+            }
+            Message::OpenSettings => {
+                view.settings_view = Some(SettingsView::new());
+                let client = view.client.clone();
+                return Command::perform(
+                    async move {
+                        client
+                            .display_name()
+                            .await
+                            .unwrap_or_default()
+                            .unwrap_or_default()
+                    },
+                    Message::SetDisplayNameInput,
+                );
+            }
+            Message::SetDisplayNameInput(name) => {
+                if let Some(ref mut settings) = view.settings_view {
+                    settings.display_name = name;
+                }
+            }
+            Message::SaveDisplayName => {
+                if let Some(ref mut settings) = view.settings_view {
+                    let client = view.client.clone();
+                    let name = settings.display_name.clone();
+                    settings.saving_name = true;
+                    return Command::perform(
+                        async move { client.set_display_name(Some(&name)).await },
+                        |result| match result {
+                            Ok(()) => Message::DisplayNameSaved,
+                            // TODO: set saving to false and report error
+                            Err(_) => Message::DisplayNameSaved,
+                        },
+                    );
+                }
+            }
+            Message::DisplayNameSaved => {
+                if let Some(ref mut settings) = view.settings_view {
+                    settings.saving_name = false;
+                }
+            }
+            Message::SetKeyPath(p) => {
+                if let Some(ref mut settings) = view.settings_view {
+                    settings.key_path = p;
+                }
+            }
+            Message::SetKeyPassword(p) => {
+                if let Some(ref mut settings) = view.settings_view {
+                    settings.key_password = p;
+                }
+            }
+            Message::ImportKeys => {
+                if let Some(ref settings) = view.settings_view {
+                    let path = std::path::PathBuf::from(&settings.key_path);
+                    let password = settings.key_password.clone();
+                    let client = view.client.clone();
+                    return Command::perform(
+                        async move { client.import_keys(path, &password).await },
+                        |result| match result {
+                            Ok(_) => Message::SetKeyPassword(String::new()),
+                            // TODO: Actual error reporting here
+                            Err(e) => Message::SetKeyPath(e.to_string()),
+                        },
+                    );
+                }
+            }
+            Message::CloseSettings => view.settings_view = None,
+            _ => (),
+        };
+        Command::none()
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -670,6 +1058,8 @@ pub enum Retrix {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Do nothing
+    Noop,
     // Login form messages
     SetUser(String),
     SetPassword(String),
@@ -690,6 +1080,8 @@ pub enum Message {
     BackFill(RoomId),
     /// Received backfill
     BackFilled(RoomId, MessageResponse),
+    /// Fetched a thumbnail
+    FetchedThumbnail(String, iced::image::Handle),
     /// Fetch an image pointed to by an mxc url
     FetchImage(String),
     /// Fetched an image
@@ -781,7 +1173,11 @@ impl Application for Retrix {
         }
     }
 
-    fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
+    fn update(
+        &mut self,
+        message: Self::Message,
+        _clipboard: &mut iced::Clipboard,
+    ) -> Command<Self::Message> {
         match self {
             Retrix::Prompt(prompt) => match message {
                 Message::SetUser(u) => prompt.user = u,
@@ -848,395 +1244,30 @@ impl Application for Retrix {
                             Message::ResetRoom(r.room_id().to_owned(), entry)
                         }
                         .into();
-                        if let Some(url) = room.avatar_url() {
-                            commands.push(async { Message::FetchImage(url) }.into())
-                        }
                         commands.push(command);
-                    }
-                    return Command::batch(commands);
-                }
-                _ => (),
-            },
-            Retrix::LoggedIn(view) => match message {
-                Message::ErrorMessage(e) => view.error = Some((e, Default::default())),
-                Message::ClearError => view.error = None,
-                Message::SetSort(s) => view.sorting = s,
-                Message::ResetRoom(id, room) => {
-                    view.rooms.insert(id.clone(), room);
-                    return async move { Message::BackFill(id) }.into();
-                }
-                Message::SelectRoom(r) => {
-                    view.selected = Some(r.clone());
-                    if view.rooms.get(&r).unwrap().messages.messages.is_empty() {
-                        return async move { Message::BackFill(r) }.into();
-                    }
-                }
-                Message::Sync(event) => match event {
-                    matrix::Event::Room(event) => match event {
-                        AnyRoomEvent::Message(event) => {
-                            let room = view.rooms.entry(event.room_id().clone()).or_default();
-                            room.messages.push(AnyRoomEvent::Message(event.clone()));
-                            let mut commands = Vec::new();
-                            let img_cmd = match event.image_url() {
-                                Some(url) => async { Message::FetchImage(url) }.into(),
-                                None => Command::none(),
-                            };
-                            commands.push(img_cmd);
-                            // Set read marker if message is in selected room
-                            if view.selected.as_ref() == Some(event.room_id()) {
-                                // Super duper gross ugly scroll to bottom hack
-                                /*view.message_scroll = unsafe {
-                                    let mut tmp = std::mem::transmute::<_, (Option<f32>, f32)>(
-                                        view.message_scroll,
-                                    );
-                                    tmp.1 = 999999.0;
-                                    std::mem::transmute::<_, iced::scrollable::State>(tmp)
-                                };*/
-
-                                let client = view.client.clone();
-                                let marker_cmd = async move {
-                                    let result = client
-                                        .read_marker(
-                                            event.room_id(),
-                                            event.event_id(),
-                                            Some(event.event_id()),
-                                        )
-                                        .await
-                                        .err();
-                                    match result {
-                                        Some(err) => Message::ErrorMessage(err.to_string()),
-                                        // TODO: Make this an actual no-op
-                                        None => Message::Login,
-                                    }
-                                }
-                                .into();
-                                commands.push(marker_cmd);
-                            }
-                            return Command::batch(commands);
-                        }
-                        AnyRoomEvent::State(event) => match event {
-                            AnyStateEvent::RoomCanonicalAlias(ref alias) => {
-                                let room = view.rooms.entry(alias.room_id.clone()).or_default();
-                                room.alias = alias.content.alias.clone();
-                                room.messages.push(AnyRoomEvent::State(event));
-                            }
-                            AnyStateEvent::RoomName(ref name) => {
-                                let id = name.room_id.clone();
-                                let room = view.rooms.entry(id.clone()).or_default();
-                                room.display_name = name.content.name().map(String::from);
-                                room.messages.push(AnyRoomEvent::State(event));
-                                let client = view.client.clone();
-                                return async move {
-                                    let joined = client.get_joined_room(&id).unwrap();
-                                    Message::RoomName(id, joined.display_name().await)
-                                }
-                                .into();
-                            }
-                            AnyStateEvent::RoomTopic(ref topic) => {
-                                let room = view.rooms.entry(topic.room_id.clone()).or_default();
-                                room.topic = topic.content.topic.clone();
-                                room.messages.push(AnyRoomEvent::State(event));
-                            }
-                            AnyStateEvent::RoomAvatar(ref avatar) => {
-                                let room = view.rooms.entry(avatar.room_id.clone()).or_default();
-                                room.messages.push(AnyRoomEvent::State(event));
-                                if let Some(url) = room.avatar.clone() {
-                                    room.avatar = Some(url.clone());
-                                    return async { Message::FetchImage(url) }.into();
-                                }
-                            }
-                            AnyStateEvent::RoomCreate(ref create) => {
-                                // Add room to the entry list
-                                let joined = view.client.get_joined_room(&create.room_id).unwrap();
-                                let id = create.room_id.clone();
-                                return async move {
-                                    let mut entry = RoomEntry::from_sdk(&joined).await;
-                                    entry.messages.push(AnyRoomEvent::State(event));
-                                    Message::ResetRoom(id, entry)
-                                }
-                                .into();
-                            }
-                            AnyStateEvent::RoomMember(ref member) => {
-                                let room = view.rooms.entry(member.room_id.clone()).or_default();
-                                let client = view.client.clone();
-                                // If we left a room, remove it from the RoomEntry list
-                                if member.state_key == view.session.user_id {
-                                    match member.content.membership {
-                                        MembershipState::Join => {
-                                            let id = member.room_id.clone();
-                                            return async move {
-                                                let joined = client.get_joined_room(&id).unwrap();
-                                                let entry = RoomEntry::from_sdk(&joined).await;
-
-                                                Message::ResetRoom(id, entry)
-                                            }
-                                            .into();
-                                        }
-                                        MembershipState::Leave => {
-                                            // Deselect room if we're leaving selected room
-                                            if view.selected.as_ref() == Some(&member.room_id) {
-                                                view.selected = None;
-                                            }
-                                            view.rooms.remove(&member.room_id);
-                                            return Command::none();
-                                        }
-                                        _ => (),
-                                    }
-                                }
-                                room.messages.push(AnyRoomEvent::State(event));
-                            }
-                            ref any => {
-                                // Ensure room exists
-                                let room = view.rooms.entry(any.room_id().clone()).or_default();
-                                room.messages.push(AnyRoomEvent::State(event));
-                            }
-                        },
-                        AnyRoomEvent::RedactedMessage(redacted) => {
-                            let room = view.rooms.entry(redacted.room_id().clone()).or_default();
-                            room.messages.push(AnyRoomEvent::RedactedMessage(redacted));
-                        }
-                        AnyRoomEvent::RedactedState(redacted) => {
-                            let room = view.rooms.entry(redacted.room_id().clone()).or_default();
-                            room.messages.push(AnyRoomEvent::RedactedState(redacted));
-                        }
-                    },
-                    matrix::Event::ToDevice(event) => match event {
-                        AnyToDeviceEvent::KeyVerificationStart(start) => {
-                            let client = view.client.clone();
-                            return Command::perform(
-                                async move {
-                                    client.get_verification(&start.content.transaction_id).await
-                                },
-                                Message::SetVerification,
-                            );
-                        }
-                        AnyToDeviceEvent::KeyVerificationCancel(cancel) => {
-                            return async { Message::VerificationCancelled(cancel.content.code) }
-                                .into();
-                        }
-                        _ => (),
-                    },
-                    matrix::Event::Token(token) => {
-                        view.sync_token = token;
-                    }
-                },
-                Message::BackFill(id) => {
-                    let room = view.rooms.entry(id.clone()).or_default();
-                    room.messages.loading = true;
-                    let client = view.client.clone();
-                    let token = match room.messages.end.clone() {
-                        Some(end) => end,
-                        None => client
-                            .get_joined_room(&id)
-                            .unwrap()
-                            .last_prev_batch()
-                            .unwrap_or_else(|| view.sync_token.clone()),
-                    };
-                    return async move {
-                        let mut request = MessageRequest::backward(&id, &token);
-                        request.limit = matrix_sdk::uint!(30);
-                        match client.room_messages(request).await {
-                            Ok(response) => Message::BackFilled(id, response),
-                            Err(e) => Message::ErrorMessage(e.to_string()),
-                        }
-                    }
-                    .into();
-                }
-                Message::BackFilled(id, response) => {
-                    let room = view.rooms.get_mut(&id).unwrap();
-                    room.messages.loading = false;
-                    let events: Vec<AnyRoomEvent> = response
-                        .chunk
-                        .into_iter()
-                        .filter_map(|e| e.deserialize().ok())
-                        .chain(
-                            response
-                                .state
-                                .into_iter()
-                                .filter_map(|e| e.deserialize().ok().map(AnyRoomEvent::State)),
-                        )
-                        .collect();
-
-                    if let Some(start) = response.start {
-                        room.messages.start = Some(start);
-                    }
-                    if let Some(end) = response.end {
-                        room.messages.end = Some(end);
-                    }
-                    let commands: Vec<Command<_>> = events
-                        .iter()
-                        .filter_map(|e| e.image_url())
-                        .map(|url| async { Message::FetchImage(url) }.into())
-                        .collect();
-                    room.messages.append(events);
-                    return Command::batch(commands);
-                }
-                Message::FetchImage(url) => {
-                    let (server, path) = match matrix::parse_mxc(&url) {
-                        Ok((server, path)) => (server, path),
-                        Err(e) => {
-                            return async move { Message::ErrorMessage(e.to_string()) }.into()
-                        }
-                    };
-                    let client = view.client.clone();
-                    return async move {
-                        let request = ImageRequest::new(&path, &*server);
-                        let response = client.send(request).await;
-                        match response {
-                            Ok(response) => Message::FetchedImage(
-                                url,
-                                iced::image::Handle::from_memory(response.file),
-                            ),
-                            Err(e) => Message::ErrorMessage(e.to_string()),
-                        }
-                    }
-                    .into();
-                }
-                Message::FetchedImage(url, handle) => {
-                    view.images.insert(url, handle);
-                }
-                Message::RoomName(id, name) => {
-                    if let Some(room) = view.rooms.get_mut(&id) {
-                        room.name = name;
-                    }
-                }
-                Message::SetVerification(v) => view.sas = v,
-                Message::VerificationAccept => {
-                    let sas = match &view.sas {
-                        Some(sas) => sas.clone(),
-                        None => return Command::none(),
-                    };
-                    return Command::perform(
-                        async move { sas.accept().await },
-                        |result| match result {
-                            Ok(()) => Message::VerificationAccepted,
-                            Err(e) => Message::ErrorMessage(e.to_string()),
-                        },
-                    );
-                }
-                Message::VerificationConfirm => {
-                    let sas = match &view.sas {
-                        Some(sas) => sas.clone(),
-                        None => return Command::none(),
-                    };
-                    return Command::perform(async move { sas.confirm().await }, |result| {
-                        match result {
-                            Ok(()) => Message::VerificationConfirmed,
-                            Err(e) => Message::ErrorMessage(e.to_string()),
-                        }
-                    });
-                }
-                Message::VerificationCancel => {
-                    let sas = match &view.sas {
-                        Some(sas) => sas.clone(),
-                        None => return Command::none(),
-                    };
-                    return Command::perform(
-                        async move { sas.cancel().await },
-                        |result| match result {
-                            Ok(()) => Message::VerificationCancelled(VerificationCancelCode::User),
-                            Err(e) => Message::ErrorMessage(e.to_string()),
-                        },
-                    );
-                }
-                Message::VerificationCancelled(code) => {
-                    view.sas = None;
-                    return async move { Message::ErrorMessage(code.as_str().to_owned()) }.into();
-                }
-                Message::VerificationClose => view.sas = None,
-                Message::SetMessage(m) => view.draft = m,
-                Message::SendMessage => {
-                    let selected = match view.selected.clone() {
-                        Some(selected) => selected,
-                        None => return Command::none(),
-                    };
-                    let draft = view.draft.clone();
-                    let client = view.client.clone();
-                    return Command::perform(
-                        async move {
-                            client
-                                .room_send(
-                                    &selected,
-                                    AnyMessageEventContent::RoomMessage(
-                                        MessageEventContent::text_plain(draft),
+                        // Fetch room avatar thumbnail if available
+                        commands.push(
+                            async move {
+                                match room
+                                    .avatar(Some(THUMBNAIL_SIZE), Some(THUMBNAIL_SIZE))
+                                    .await
+                                {
+                                    Ok(Some(avatar)) => Message::FetchedThumbnail(
+                                        room.avatar_url().unwrap(),
+                                        iced::image::Handle::from_memory(avatar),
                                     ),
-                                    None,
-                                )
-                                .await
-                        },
-                        |result| match result {
-                            Ok(_) => Message::SetMessage(String::new()),
-                            Err(e) => Message::ErrorMessage(e.to_string()),
-                        },
-                    );
-                }
-                Message::OpenSettings => {
-                    view.settings_view = Some(SettingsView::new());
-                    let client = view.client.clone();
-                    return Command::perform(
-                        async move {
-                            client
-                                .display_name()
-                                .await
-                                .unwrap_or_default()
-                                .unwrap_or_default()
-                        },
-                        Message::SetDisplayNameInput,
-                    );
-                }
-                Message::SetDisplayNameInput(name) => {
-                    if let Some(ref mut settings) = view.settings_view {
-                        settings.display_name = name;
+                                    Ok(None) => Message::Noop,
+                                    Err(e) => Message::ErrorMessage(e.to_string()),
+                                }
+                            }
+                            .into(),
+                        )
                     }
+                    return Command::batch(commands);
                 }
-                Message::SaveDisplayName => {
-                    if let Some(ref mut settings) = view.settings_view {
-                        let client = view.client.clone();
-                        let name = settings.display_name.clone();
-                        settings.saving_name = true;
-                        return Command::perform(
-                            async move { client.set_display_name(Some(&name)).await },
-                            |result| match result {
-                                Ok(()) => Message::DisplayNameSaved,
-                                // TODO: set saving to false and report error
-                                Err(_) => Message::DisplayNameSaved,
-                            },
-                        );
-                    }
-                }
-                Message::DisplayNameSaved => {
-                    if let Some(ref mut settings) = view.settings_view {
-                        settings.saving_name = false;
-                    }
-                }
-                Message::SetKeyPath(p) => {
-                    if let Some(ref mut settings) = view.settings_view {
-                        settings.key_path = p;
-                    }
-                }
-                Message::SetKeyPassword(p) => {
-                    if let Some(ref mut settings) = view.settings_view {
-                        settings.key_password = p;
-                    }
-                }
-                Message::ImportKeys => {
-                    if let Some(ref settings) = view.settings_view {
-                        let path = std::path::PathBuf::from(&settings.key_path);
-                        let password = settings.key_password.clone();
-                        let client = view.client.clone();
-                        return Command::perform(
-                            async move { client.import_keys(path, &password).await },
-                            |result| match result {
-                                Ok(_) => Message::SetKeyPassword(String::new()),
-                                // TODO: Actual error reporting here
-                                Err(e) => Message::SetKeyPath(e.to_string()),
-                            },
-                        );
-                    }
-                }
-                Message::CloseSettings => view.settings_view = None,
                 _ => (),
             },
+            Retrix::LoggedIn(view) => return view.update(message),
         };
         Command::none()
     }

@@ -1,5 +1,6 @@
 use std::{
     convert::TryFrom,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -7,10 +8,10 @@ use async_stream::stream;
 use matrix_sdk::{
     api::r0::{account::register::Request as RegistrationRequest, uiaa::AuthData},
     events::{
-        room::message::{MessageEvent, MessageEventContent},
+        room::message::{MessageEvent, MessageEventContent, MessageType},
         AnyMessageEvent, AnyRoomEvent, AnySyncRoomEvent, AnyToDeviceEvent,
     },
-    identifiers::{DeviceId, EventId, ServerName, UserId},
+    identifiers::{DeviceId, EventId, RoomId, ServerName, UserId},
     reqwest::Url,
     Client, ClientConfig, LoopCtrl, SyncSettings,
 };
@@ -171,6 +172,7 @@ pub fn parse_mxc(url: &str) -> Result<(Box<ServerName>, String), Error> {
     }
 }
 
+/// Makes an iced subscription for listening for matrix events.
 pub struct MatrixSync {
     client: matrix_sdk::Client,
     join: Option<tokio::task::JoinHandle<()>>,
@@ -183,51 +185,20 @@ impl MatrixSync {
     }
 }
 
+/// A matrix event that should be passed to the iced subscription
 #[derive(Clone, Debug)]
 pub enum Event {
-    Room(AnyRoomEvent),
+    /// An event for an invited room
+    Invited(AnyRoomEvent, Arc<matrix_sdk::room::Invited>),
+    /// An event for a joined room
+    Joined(AnyRoomEvent, Arc<matrix_sdk::room::Joined>),
+    /// An event for a left room
+    Left(AnyRoomEvent, Arc<matrix_sdk::room::Left>),
+    /// A to-device event
     ToDevice(AnyToDeviceEvent),
+    /// Synchronization token
     Token(String),
 }
-
-/*pub enum Sync {
-    MessageInvited()
-    MessageJoined(RoomId, AnyRoomEvent),
-    MessageLeft(RoomId, AnyRoomEvent),
-}
-
-struct Emitter {
-    client: Client,
-    sender: tokio::sync::mpsc::Sender<Sync>,
-}
-
-#[async_trait]
-impl matrix_sdk::EventEmitter for Emitter {
-    async fn on_room_message(
-        &self,
-        room: RoomState,
-        message: &SyncMessageEvent<MessageEventContent>,
-    ) {
-        let id = room.room_id().to_owned();
-        let full = AnyRoomEvent::Message(
-            AnyMessageEvent::RoomMessage(
-                message
-                .to_owned()
-                .into_full_event(id.clone()),
-            ),
-        );
-        if let RoomState::Joined(room) = room {
-            self.sender
-                .send(Sync::MessageJoined(id, full))
-                .await
-                .ok();
-        }
-    }
-
-    async fn on_room_member(&self, room: RoomState, member: &SyncStateEvent<MemberEventContent>) {
-
-    }
-}*/
 
 impl<H, I> iced_futures::subscription::Recipe<H, I> for MatrixSync
 where
@@ -255,33 +226,16 @@ where
                         .token(client.sync_token().await.unwrap())
                         .timeout(Duration::from_secs(30)),
                     |response| async {
-                        //sender.send(Event::Token(response.next_batch)).ok();
                         for (id, room) in response.rooms.join {
+                            let joined = Arc::new(client.get_joined_room(&id).unwrap());
                             for event in room.state.events {
                                 let id = id.clone();
-                                sender
-                                    .send(Event::Room(AnyRoomEvent::State(
-                                        event.into_full_event(id),
-                                    )))
-                                    .ok();
+                                let event = AnyRoomEvent::State(event.into_full_event(id));
+                                sender.send(Event::Joined(event, Arc::clone(&joined))).ok();
                             }
                             for event in room.timeline.events {
-                                let id = id.clone();
-                                let event = match event {
-                                    AnySyncRoomEvent::Message(e) => {
-                                        AnyRoomEvent::Message(e.into_full_event(id))
-                                    }
-                                    AnySyncRoomEvent::State(e) => {
-                                        AnyRoomEvent::State(e.into_full_event(id))
-                                    }
-                                    AnySyncRoomEvent::RedactedMessage(e) => {
-                                        AnyRoomEvent::RedactedMessage(e.into_full_event(id))
-                                    }
-                                    AnySyncRoomEvent::RedactedState(e) => {
-                                        AnyRoomEvent::RedactedState(e.into_full_event(id))
-                                    }
-                                };
-                                sender.send(Event::Room(event)).ok();
+                                let event = event.into_full_event(id.clone());
+                                sender.send(Event::Joined(event, Arc::clone(&joined))).ok();
                             }
                         }
                         for event in response.to_device.events {
@@ -345,10 +299,33 @@ impl AnyMessageEventExt for AnyMessageEvent {
     fn image_url(&self) -> Option<String> {
         match self {
             AnyMessageEvent::RoomMessage(MessageEvent {
-                content: MessageEventContent::Image(ref image),
+                content:
+                    MessageEventContent {
+                        msgtype: MessageType::Image(ref image),
+                        ..
+                    },
                 ..
             }) => image.url.clone(),
             _ => None,
+        }
+    }
+}
+
+pub trait AnySyncRoomEventExt {
+    fn into_full_event(self, room_id: RoomId) -> AnyRoomEvent;
+}
+
+impl AnySyncRoomEventExt for AnySyncRoomEvent {
+    fn into_full_event(self, id: RoomId) -> AnyRoomEvent {
+        match self {
+            AnySyncRoomEvent::Message(e) => AnyRoomEvent::Message(e.into_full_event(id)),
+            AnySyncRoomEvent::State(e) => AnyRoomEvent::State(e.into_full_event(id)),
+            AnySyncRoomEvent::RedactedMessage(e) => {
+                AnyRoomEvent::RedactedMessage(e.into_full_event(id))
+            }
+            AnySyncRoomEvent::RedactedState(e) => {
+                AnyRoomEvent::RedactedState(e.into_full_event(id))
+            }
         }
     }
 }
